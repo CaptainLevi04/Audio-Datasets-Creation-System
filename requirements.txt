@@ -1,0 +1,13 @@
+# Core dependencies for Student 1 (Audio Pipeline: Steps 1 to 4)
+yt-dlp>=2024.0.0
+numpy>=1.22.0
+scipy>=1.9.0
+pandas>=1.5.0
+matplotlib>=3.6.0
+torch>=2.0.0
+soundfile>=0.12.0
+tqdm>=4.65.0
+
+# Optional dependencies (Step 3 neural classifier & Step 4 video clipping)
+# panns_inference>=0.1.1
+# moviepy>=1.0.3

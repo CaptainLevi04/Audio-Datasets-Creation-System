@@ -1,0 +1,36 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Data directories and large media files
+data/
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.mkv
+*.webm
+scratch_nb_dump.txt
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# PyTorch and model checkpoints
+*.pth
+*.pt
+*.onnx
+.cache/
+
+# OS specific
+.DS_Store
+Thumbs.db
