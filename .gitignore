@@ -9,14 +9,24 @@ __pycache__/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
 
-# Data directories and large media files
+# Data directories, models, and outputs
 data/
+reports/
+splits/
 *.wav
 *.mp3
 *.flac
 *.mp4
 *.mkv
 *.webm
+
+# Temporary, build, and scratch files
+build_*.py
+*(*).py
+*(*).ipynb
+scratch/
+*.tmp
+*.log
 scratch_nb_dump.txt
 
 # Virtual environments
