@@ -86,6 +86,15 @@ def plot_spectrogram_regions(y: np.ndarray, regions_df: pd.DataFrame,
     return fig
 
 
+def plot_audio_timeline(y: np.ndarray, regions_df: pd.DataFrame,
+                        out_path: str | Path | None = None,
+                        sr: int = DEFAULT_SR,
+                        title: str = "Audio Spectrogram & Classification Regions",
+                        **kwargs) -> plt.Figure:
+    """Convenience alias for plot_spectrogram_regions."""
+    return plot_spectrogram_regions(y, regions_df, sr=sr, title=title, save_path=out_path, **kwargs)
+
+
 def plot_segments_overview(audio: np.ndarray, segments_df: pd.DataFrame,
                            sr: int = DEFAULT_SR, max_segments: int = 20,
                            fmax: int = 8000,
@@ -127,10 +136,11 @@ def plot_segments_overview(audio: np.ndarray, segments_df: pd.DataFrame,
         title = f"Spectrogram & Pause Cuts (First {len(sub_df)} Segments | 5–15s)"
     ax_spec.set_title(title, fontsize=13, fontweight="bold", pad=8)
 
-    color_map = {"speech": "#1f77b4", "mixed": "#ff7f0e"}
+    color_map = {"speech": "#1f77b4", "mixed": "#ff7f0e", "music": "#2ca02c", "silence": "#7f7f7f"}
 
     for row in sub_df.itertuples():
-        seg_color = color_map.get(row.source_region_label, "#2ca02c")
+        lbl = getattr(row, "primary_label", getattr(row, "label", getattr(row, "source_region_label", "speech")))
+        seg_color = color_map.get(lbl, "#2ca02c")
         
         # Segment vertical boundary lines
         ax_spec.axvline(row.start, color="cyan", lw=1.2, ls="--", alpha=0.85)
@@ -143,7 +153,7 @@ def plot_segments_overview(audio: np.ndarray, segments_df: pd.DataFrame,
         # Label text inside segment bar
         ax_bars.text(
             row.start + width / 2.0, 0,
-            f"#{row.segment_id}\n{row.source_region_label}\n{row.duration:.1f}s",
+            f"#{row.segment_id}\n{lbl}\n{row.duration:.1f}s",
             ha="center", va="center", fontsize=7.5, fontweight="bold", color="white"
         )
 
@@ -159,13 +169,15 @@ def plot_segments_overview(audio: np.ndarray, segments_df: pd.DataFrame,
     table_cols = ["Segment ID", "Start (s)", "End (s)", "Duration (s)", "Label", "Confidence", "Audio File"]
     table_data = []
     for r in sub_df.itertuples():
+        lbl = getattr(r, "primary_label", getattr(r, "label", getattr(r, "source_region_label", "speech")))
+        conf = getattr(r, "confidence", 1.0)
         table_data.append([
             r.segment_id,
             f"{r.start:.2f}",
             f"{r.end:.2f}",
             f"{r.duration:.2f}",
-            r.source_region_label,
-            f"{r.confidence:.2f}",
+            lbl,
+            f"{conf:.2f}",
             r.wav_file
         ])
 

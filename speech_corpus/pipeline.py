@@ -3,35 +3,43 @@ from pathlib import Path
 from typing import Literal
 import pandas as pd
 
-from .audio import DEFAULT_SR, extract_audio, extract_audio_hq, read_wav, wav_info, write_wav
+from .audio import (
+    DEFAULT_SR, extract_audio, extract_audio_hq, extract_audio_conditioned,
+    extract_source_archive, read_wav, wav_info, write_wav
+)
 from .downloader import download_video, process_local_file
 from .labelling import build_mock_audio, classify_audio
-from .segmentation import cut_speech_and_mixed_segments
+from .cut_engine_v2 import cut_speech_and_mixed_segments
 from .video_cutter import cut_video_segments_ffmpeg
 from .visualization import plot_segments_overview, plot_spectrogram_regions
 
 
 def print_segments_table(segments_df: pd.DataFrame, max_rows: int = 20):
     sub = segments_df.head(max_rows)
-    print("\n" + "-" * 75)
+    print("\n" + "-" * 105)
     print(f"  SEGMENTS SUMMARY (First {len(sub)} of {len(segments_df)} total)")
-    print("-" * 75)
-    header = f"{'ID':<6} | {'Start (s)':<10} | {'End (s)':<10} | {'Dur (s)':<8} | {'Label':<8} | {'Conf':<6} | {'File'}"
+    print("-" * 105)
+    header = f"{'ID':<6} | {'Start':<7} | {'End':<7} | {'Dur':<6} | {'Label':<8} | {'Tier':<6} | {'Cert':<5} | {'Priority':<8} | {'File'}"
     print(header)
-    print("-" * 75)
+    print("-" * 105)
     for row in sub.itertuples():
-        print(f"{row.segment_id:<6} | {row.start:<10.2f} | {row.end:<10.2f} | {row.duration:<8.2f} | {row.source_region_label:<8} | {row.confidence:<6.2f} | {row.wav_file}")
-    print("-" * 75)
+        lbl = getattr(row, "primary_label", getattr(row, "label", "speech"))
+        tier = getattr(row, "cut_tier", "HIGH")
+        cert = getattr(row, "cut_certainty", getattr(row, "certainty", 1.0))
+        prio = getattr(row, "review_priority", "LOW")
+        print(f"{row.segment_id:<6} | {row.start:<7.2f} | {row.end:<7.2f} | {row.duration:<6.2f} | {lbl:<8} | {tier:<6} | {cert:<5.2f} | {prio:<8} | {row.wav_file}")
+    print("-" * 105)
 
 
 def run_student1_pipeline(source: str,
                           data_dir: str | Path = "data",
                           is_url: bool = True,
-                          backend: Literal["heuristic", "panns"] = "heuristic",
+                          backend: Literal["ast", "heuristic", "panns"] = "ast",
                           vad_backend: Literal["auto", "silero", "energy"] = "auto",
-                          max_height: int = 480,
+                          max_height: int = 360,
                           cut_video: bool = False,
-                          save_spectrogram: bool = True) -> dict:
+                          save_spectrogram: bool = True,
+                          device: str | None = None) -> dict:
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -47,9 +55,11 @@ def run_student1_pipeline(source: str,
         video_dir = data_dir / meta["video_id"]
         video_dir.mkdir(parents=True, exist_ok=True)
         final_video_path = video_dir / raw_video_path.name
-        raw_video_path.replace(final_video_path)
+        if raw_video_path.resolve() != final_video_path.resolve() and raw_video_path.exists():
+            raw_video_path.replace(final_video_path)
         try:
-            tmp_dir.rmdir()
+            if tmp_dir.exists() and not any(tmp_dir.iterdir()):
+                tmp_dir.rmdir()
         except OSError:
             pass
     else:
@@ -59,19 +69,19 @@ def run_student1_pipeline(source: str,
         final_video_path, meta = process_local_file(file_path, video_dir)
 
     # Step 2: Audio extraction
-    print("\n[Step 2/4] Extracting 16 kHz mono 16-bit WAV...")
+    print("\n[Step 2/4] Extracting 16 kHz mono 16-bit WAV & Conditioned FLAC...")
     wav_path = video_dir / "audio.wav"
-    flac_path = video_dir / "audio_hq.flac"
+    flac_path = video_dir / "audio_conditioned.flac"
 
     extract_audio(final_video_path, wav_path)
-    extract_audio_hq(final_video_path, flac_path)
+    extract_audio_conditioned(final_video_path, flac_path)
     audio_meta = wav_info(wav_path)
 
     record = dict(meta)
     record.update({
         "video_file": final_video_path.name,
         "audio_file": wav_path.name,
-        "audio_hq_file": flac_path.name,
+        "audio_conditioned_file": flac_path.name,
         "audio_info": audio_meta,
         "dir": str(video_dir),
     })
@@ -82,13 +92,26 @@ def run_student1_pipeline(source: str,
     print(f"  Duration: {audio_meta['duration_sec'] / 60.0:.2f} min | Channel: {meta['channel']}")
 
     # Step 3: Classification
-    print("\n[Step 3/4] Region classification (speech, music, mixed, silence)...")
+    print(f"\n[Step 3/4] Region classification (speech, music, mixed, silence) via [{backend.upper()}]...")
     audio_samples, sr = read_wav(wav_path)
-    regions_df, probs = classify_audio(audio_samples, sr=sr, backend=backend)
-
+    total_dur = len(audio_samples) / sr
     regions_csv = video_dir / "regions.csv"
-    regions_df.to_csv(regions_csv, index=False)
-    print(f"  Regions identified: {len(regions_df)}")
+
+    from .ast_model import validate_cached_regions, save_regions
+    if validate_cached_regions(regions_csv, expected_source_id=video_dir.name, expected_duration=total_dur, expected_version="2.2"):
+        print(f"  Valid cached regions found (v2.2): {regions_csv}")
+        regions_df = pd.read_csv(regions_csv)
+        raw_preds = None
+    else:
+        regions_df, raw_preds = classify_audio(audio_samples, sr=sr, backend=backend, device=device)
+        save_regions(regions_df, regions_csv, source_id=video_dir.name, duration=total_dur, version="2.2")
+        print(f"  Regions identified and saved (v2.2): {len(regions_df)}")
+
+    # If window-level predictions DataFrame exists, save windows_5s.csv
+    if isinstance(raw_preds, pd.DataFrame):
+        windows_csv = video_dir / "windows_5s.csv"
+        raw_preds.to_csv(windows_csv, index=False)
+        print(f"  Window-level predictions (5s) saved: {windows_csv}")
 
     # Full audio macro-view
     if save_spectrogram:
@@ -143,10 +166,32 @@ def run_student1_pipeline(source: str,
         "regions_csv": str(regions_csv),
         "segments_csv": str(video_dir / "segments.csv"),
         "spectrogram_png": str(video_dir / "spectrogram.png"),
+        "segments": segments_df,
     }
 
 
-def run_mock_pipeline(out_dir: str | Path = "data/mock_demo") -> dict:
+def run_student1(url: str,
+                 profile: dict | None = None,
+                 data_dir: str | Path = "data",
+                 device: str | None = None) -> pd.DataFrame:
+    """Standard function API for Student 3 (UI App / Streamlit / Gradio) & Live Demo.
+    
+    Accepts video URL and profile dict, runs the optimized Steps 1-4 pipeline,
+    and returns the manifest DataFrame (saved to segments.csv).
+    """
+    res = run_student1_pipeline(
+        source=url,
+        data_dir=data_dir,
+        is_url=True,
+        backend="ast",
+        vad_backend="auto",
+        device=device
+    )
+    return res["segments"]
+
+
+def run_mock_pipeline(out_dir: str | Path = "data/mock_demo",
+                      backend: Literal["ast", "heuristic", "panns"] = "ast") -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -172,9 +217,11 @@ def run_mock_pipeline(out_dir: str | Path = "data/mock_demo") -> dict:
     write_wav(mock_wav, y_mock, sample_rate=DEFAULT_SR)
 
     # Step 3
-    print("Running Step 3 classification...")
-    regions_df, probs = classify_audio(y_mock, sr=DEFAULT_SR, backend="heuristic")
+    print(f"Running Step 3 classification via [{backend.upper()}]...")
+    regions_df, raw_preds = classify_audio(y_mock, sr=DEFAULT_SR, backend=backend)
     regions_df.to_csv(out_dir / "regions.csv", index=False)
+    if isinstance(raw_preds, pd.DataFrame):
+        raw_preds.to_csv(out_dir / "windows_5s.csv", index=False)
 
     full_spec = out_dir / "full_spectrogram.png"
     plot_spectrogram_regions(y_mock, regions_df, gt_df=gt_df, sr=DEFAULT_SR, save_path=full_spec)
@@ -212,4 +259,5 @@ def run_mock_pipeline(out_dir: str | Path = "data/mock_demo") -> dict:
         "num_segments": len(segments_df),
         "segments_csv": str(out_dir / "segments.csv"),
         "spectrogram_png": str(spec_path),
+        "segments": segments_df,
     }

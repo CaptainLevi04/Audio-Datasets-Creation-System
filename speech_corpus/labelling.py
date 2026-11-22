@@ -3,7 +3,7 @@ Computes frame-level class probabilities (via Heuristic acoustic features or PAN
 applies temporal smoothing and duration filtering, and computes confidence scores.
 """
 
-from typing import Literal
+from typing import Literal, Any
 import numpy as np
 import pandas as pd
 from scipy import signal
@@ -233,22 +233,132 @@ def probs_to_regions(probs: np.ndarray, total_dur: float,
     return pd.DataFrame(rows)
 
 
-def classify_audio(y: np.ndarray, sr: int = DEFAULT_SR,
-                   backend: Literal["heuristic", "panns"] = "heuristic",
-                   device: str = "cpu") -> tuple[pd.DataFrame, np.ndarray]:
-    """Top-level classifier function for Step 3.
+def classify_audio_ast(y: np.ndarray, sr: int = DEFAULT_SR,
+                       win_s: float = 5.0, hop_s: float = 2.5,
+                       batch_size: int = 32,
+                       device: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Classify audio using Audio Spectrogram Transformer (AST).
+    
+    Generates 5s window predictions (hop 2.5s) with:
+    - 4 content classes [speech, music, mixed, silence]
+    - Quality [clean, noisy]
+    - Margin-based Certainty and Urgency scoring
+    - Merges consecutive windows with matching content into continuous regions
     
     Returns:
-        (regions_df, frame_probabilities)
+        (regions_df, windows_df)
+    """
+    from .ast_model import ast_predict_audio_windows
+    
+    windows_df = ast_predict_audio_windows(y, sr=sr, win_s=win_s, hop_s=hop_s, batch_size=batch_size, device=device)
+    total_dur = len(y) / sr
+    
+    if len(windows_df) == 0:
+        return pd.DataFrame(), windows_df
+
+    # 1. Mode filter on predicted classes to suppress single-window spurts
+    preds_idx = [LABELS.index(row["pred_content"]) for _, row in windows_df.iterrows()]
+    smoothed_idx = mode_filter(np.array(preds_idx), k=3)
+
+    # 2. Group into contiguous index runs (a, b)
+    runs = []
+    s = 0
+    for i in range(1, len(smoothed_idx) + 1):
+        if i == len(smoothed_idx) or smoothed_idx[i] != smoothed_idx[s]:
+            runs.append((s, i, smoothed_idx[s]))
+            s = i
+
+    # 3. Create strictly contiguous, non-overlapping regions
+    regions = []
+    for k, (a, b, l_idx) in enumerate(runs):
+        start = 0.0 if k == 0 else round(a * hop_s, 3)
+        end = round(total_dur, 3) if k == len(runs) - 1 else round(b * hop_s, 3)
+        label = LABELS[l_idx]
+
+        sub_windows = windows_df.iloc[a:b]
+        if f"p_{label}" in sub_windows:
+            conf = float(sub_windows[f"p_{label}"].mean())
+        elif "content_confidence" in sub_windows:
+            conf = float(sub_windows["content_confidence"].mean())
+        elif "confidence" in sub_windows:
+            conf = float(sub_windows["confidence"].mean())
+        else:
+            conf = 0.85
+
+        if "pred_quality" in sub_windows.columns:
+            qualities = list(sub_windows["pred_quality"])
+            q_label = max(set(qualities), key=qualities.count)
+            q_conf = float(sub_windows[sub_windows["pred_quality"] == q_label]["quality_confidence"].mean()) if "quality_confidence" in sub_windows.columns else 0.90
+        else:
+            q_label = "HQ"
+            q_conf = 0.95
+
+        min_cert = float(sub_windows["certainty"].min()) if "certainty" in sub_windows.columns else float(conf)
+        urgency = round(1.0 - min_cert, 3)
+        if min_cert < 0.35:
+            priority = "URGENT"
+        elif min_cert < 0.65:
+            priority = "MEDIUM"
+        else:
+            priority = "LOW"
+
+        p_sp = float(sub_windows["p_speech"].mean()) if "p_speech" in sub_windows.columns else 0.0
+        p_mu = float(sub_windows["p_music"].mean()) if "p_music" in sub_windows.columns else 0.0
+        p_mx = float(sub_windows["p_mixed"].mean()) if "p_mixed" in sub_windows.columns else min(p_sp, p_mu)
+        p_si = float(sub_windows["p_silence"].mean()) if "p_silence" in sub_windows.columns else 0.0
+
+        regions.append({
+            "region_id": f"R{k+1:04d}",
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
+            "label": label,
+            "confidence": round(float(np.clip(conf, 0.0, 1.0)), 3),
+            "pred_quality": q_label,
+            "quality_confidence": round(float(np.clip(q_conf, 0.0, 1.0)), 3),
+            "certainty": round(min_cert, 3),
+            "urgency": urgency,
+            "review_priority": priority,
+            "p_speech": round(p_sp, 4),
+            "p_music": round(p_mu, 4),
+            "p_mixed": round(p_mx, 4),
+            "p_silence": round(p_si, 4),
+            "human_content": "",
+            "human_quality": "",
+            "status": "unreviewed",
+            "notes": ""
+        })
+
+    return pd.DataFrame(regions), windows_df
+
+
+def classify_audio(y: np.ndarray, sr: int = DEFAULT_SR,
+                   backend: Literal["ast", "heuristic", "panns"] = "ast",
+                   batch_size: int = 32,
+                   device: str | None = None) -> tuple[pd.DataFrame, Any]:
+    """Top-level classifier function for Step 3.
+    
+    Args:
+        y: Audio signal array (16 kHz).
+        sr: Sample rate.
+        backend: 'ast' (default neural transformer), 'heuristic' (fast zero-model), or 'panns'.
+        batch_size: Batch size for AST evaluation (default 32).
+        device: 'cuda' or 'cpu'.
+        
+    Returns:
+        (regions_df, raw_predictions_or_probs)
     """
     total_dur = len(y) / sr
-    if backend == "panns":
-        probs = panns_probs(y, sr=sr, device=device)
+    if backend == "ast":
+        return classify_audio_ast(y, sr=sr, batch_size=batch_size, device=device)
+    elif backend == "panns":
+        probs = panns_probs(y, sr=sr, device=device or "cpu")
+        regions = probs_to_regions(probs, total_dur=total_dur)
+        return regions, probs
     else:
         probs = heuristic_probs(y, sr=sr)
-
-    regions = probs_to_regions(probs, total_dur=total_dur)
-    return regions, probs
+        regions = probs_to_regions(probs, total_dur=total_dur)
+        return regions, probs
 
 
 # =====================================================================

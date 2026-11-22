@@ -1,0 +1,25 @@
+{
+  "content_classes": [
+    "speech",
+    "music",
+    "mixed",
+    "silence"
+  ],
+  "quality_classes": [
+    "clean",
+    "noisy"
+  ],
+  "review_status": [
+    "unreviewed",
+    "verified",
+    "uncertain"
+  ],
+  "review_priority": [
+    "URGENT",
+    "MEDIUM",
+    "LOW"
+  ],
+  "sampling_rate": 16000,
+  "analysis_window_sec": 5.0,
+  "analysis_hop_sec": 2.5
+}

@@ -1,328 +1,593 @@
-"""Step 4: Cut Speech and Mixed regions into 5–15 second segments at real pauses.
-Implements Silero VAD pause detector with seamless energy-based fallback.
-Ensures cuts happen strictly during inter-word or inter-sentence pauses (never mid-word),
-and preserves 0.1–0.2s of silence at both boundaries of each segment.
+"""Step 3.5 & Step 4 Preparation: Short-Time Energy, Adaptive Silence Floor, and VAD Pauses.
+Vectorised short-time energy (cumsum), Otsu-based adaptive silence threshold,
+Silero VAD pause extraction with explicit speech padding, and audit logging.
 """
 
 from pathlib import Path
-from typing import Literal
+import math
+import time
+from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
-from scipy import signal
 
-from .audio import DEFAULT_SR, read_wav, write_wav
+try:
+    import torch
+except ImportError:
+    torch = None
 
-MIN_SEGMENT_DUR = 5.0
-MAX_SEGMENT_DUR = 15.0
-TARGET_SEGMENT_DUR = 10.0
-DEFAULT_PADDING_SEC = 0.15
+from .audio import DEFAULT_SR
+
+_SILERO = {}
+VAD_BACKEND_USED = {"name": None}
 
 
-# =====================================================================
-# 1. Pause Detection Backends: Energy-based & Silero VAD
-# =====================================================================
+def compute_energy_db(audio: np.ndarray, sr: int = DEFAULT_SR,
+                      frame_ms: float = 25.0, hop_ms: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorised short-time RMS energy (dB) using cumulative sum.
+    Returns (frame_start_times, energy_db). ~100x faster than a Python loop.
+    """
+    frame_len, hop = int(sr * frame_ms / 1000), int(sr * hop_ms / 1000)
+    if len(audio) < frame_len:
+        audio = np.pad(audio, (0, frame_len - len(audio)))
+    c = np.concatenate(([0.0], np.cumsum(audio.astype(np.float64) ** 2)))
+    idx = np.arange(0, len(audio) - frame_len + 1, hop)
+    ms = np.maximum((c[idx + frame_len] - c[idx]) / frame_len, 0.0)
+    return idx / sr, (10.0 * np.log10(ms + 1e-14)).astype(np.float32)
+
+
+def adaptive_silence_floor(energy_db: np.ndarray) -> Tuple[float, float]:
+    """Otsu threshold on the dB histogram (separates quiet/ambient frames from loud frames).
+    Returns (floor_db = median of the quiet class, threshold_db).
+    """
+    e = np.clip(energy_db, -100.0, 0.0)
+    lo, hi = np.percentile(e, [1, 99])
+    if hi - lo < 3.0:
+        return float(lo), float(lo + 8.5)
+    edges = np.arange(math.floor(lo), math.ceil(hi) + 1, 1.0)
+    hist, edges = np.histogram(e, bins=edges)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    w = hist.astype(float)
+    w0, m = np.cumsum(w), np.cumsum(w * centers)
+    w1 = w.sum() - w0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = w0 * w1 * (m / w0 - (m[-1] - m) / w1) ** 2
+    thr = float(centers[int(np.argmax(np.nan_to_num(between)))])
+    low = e[e <= thr]
+    floor = float(np.median(low)) if low.size else float(lo)
+    return floor, float(np.clip(thr, floor + 3.0, floor + 20.0))
+
+
+def _true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Return list of (start_idx, end_idx_exclusive) for contiguous True runs."""
+    m = np.concatenate(([False], np.asarray(mask, dtype=bool), [False])).astype(np.int8)
+    d = np.diff(m)
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+class PauseInterval:
+    """Represents a speech pause interval with start, end, center, duration."""
+    def __init__(self, start: float, end: float, center: Optional[float] = None):
+        self.start = round(float(start), 3)
+        self.end = round(float(end), 3)
+        self.center = round(float(center if center is not None else (start + end) / 2.0), 3)
+        self.duration = round(self.end - self.start, 3)
+        self.duration_ms = round(self.duration * 1000.0, 1)
+
+
+def _load_silero():
+    """Load Silero VAD model checking local cache first to prevent remote hangs."""
+    if "m" not in _SILERO:
+        import os
+        cache_dir = os.path.expanduser("~/.cache/torch/hub/snakers4_silero-vad_master")
+        if os.path.exists(cache_dir):
+            try:
+                model, utils = torch.hub.load(cache_dir, "silero_vad", source="local", trust_repo=True)
+                _SILERO["m"] = (model, utils[0])
+                return _SILERO["m"]
+            except Exception:
+                pass
+        model, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True)
+        _SILERO["m"] = (model, utils[0])
+    return _SILERO["m"]
+
 
 def detect_pauses_energy(audio: np.ndarray, sr: int = DEFAULT_SR,
-                         frame_ms: float = 25.0, hop_ms: float = 10.0,
-                         min_pause_ms: float = 180.0,
-                         pause_margin_db: float = 12.0) -> list[tuple[float, float, float]]:
-    """Detect natural pauses (silence between words/sentences) using short-time energy.
-    
-    Returns:
-        List of tuples: (pause_start_sec, pause_end_sec, pause_center_sec)
-    """
-    frame_len = int(sr * frame_ms / 1000.0)
-    hop_len = int(sr * hop_ms / 1000.0)
-
-    num_frames = (len(audio) - frame_len) // hop_len + 1
-    if num_frames <= 0:
-        return []
-
-    # Fast sliding window RMS energy
-    strided = np.lib.stride_tricks.sliding_window_view(
-        audio[:(num_frames - 1) * hop_len + frame_len], frame_len
-    )[::hop_len]
-    rms = np.sqrt(np.mean(strided**2, axis=1) + 1e-12)
-    db = 20.0 * np.log10(rms + 1e-6)
-
-    # Threshold relative to active noise floor
-    noise_floor = np.percentile(db, 10)
-    threshold = noise_floor + pause_margin_db
-    is_quiet = db < threshold
-
-    min_pause_frames = int(min_pause_ms / hop_ms)
+                         min_pause_ms: int = 120) -> List[PauseInterval]:
+    """Fallback pause detector based purely on short-time RMS energy."""
+    times, e = compute_energy_db(audio, sr)
+    _, thr = adaptive_silence_floor(e)
+    total = len(audio) / sr
     pauses = []
-    start_f = None
-    for i, quiet in enumerate(is_quiet):
-        if quiet and start_f is None:
-            start_f = i
-        elif not quiet and start_f is not None:
-            if (i - start_f) >= min_pause_frames:
-                p_start = start_f * hop_ms / 1000.0
-                p_end = i * hop_ms / 1000.0
-                pauses.append((p_start, p_end, (p_start + p_end) / 2.0))
-            start_f = None
-
-    if start_f is not None and (len(is_quiet) - start_f) >= min_pause_frames:
-        p_start = start_f * hop_ms / 1000.0
-        p_end = len(is_quiet) * hop_ms / 1000.0
-        pauses.append((p_start, p_end, (p_start + p_end) / 2.0))
-
+    for a, b in _true_runs(e < thr):
+        t0 = float(times[a])
+        t1 = float(times[b]) if b < len(times) else total   # closes a pause open at EOF
+        if t1 - t0 >= min_pause_ms / 1000.0:
+            pauses.append(PauseInterval(t0, t1))
     return pauses
 
 
-def detect_pauses_silero(audio: np.ndarray, sr: int = DEFAULT_SR,
-                         min_silence_ms: int = 200) -> list[tuple[float, float, float]]:
-    """Detect speech pauses using Silero VAD neural model via PyTorch.
-    Falls back gracefully to energy pause detection if network/cache is unavailable.
+def detect_pauses_silero(audio: np.ndarray, sr: int = DEFAULT_SR, min_pause_ms: int = 120,
+                         speech_pad_ms: int = 10, vad_backend: str = "auto") -> List[PauseInterval]:
+    """Pauses = gaps between Silero speech segments.
+    Explicit speech_pad_ms=10 prevents shrinking pauses by 60 ms.
     """
-    try:
-        import torch
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=False
-        )
-        get_speech_timestamps = utils[0]
-        wav_tensor = torch.from_numpy(audio).float()
-        if wav_tensor.ndim > 1:
-            wav_tensor = wav_tensor.mean(dim=-1)
-
-        speech_timestamps = get_speech_timestamps(
-            wav_tensor,
-            model,
-            sampling_rate=sr,
-            min_silence_duration_ms=min_silence_ms
-        )
-
-        # Invert speech timestamps to obtain silence/pause intervals
-        pauses = []
-        last_end = 0.0
-        for st in speech_timestamps:
-            sp_start = st["start"] / sr
-            sp_end = st["end"] / sr
-            if sp_start - last_end >= (min_silence_ms / 1000.0):
-                pauses.append((last_end, sp_start, (last_end + sp_start) / 2.0))
-            last_end = sp_end
-
-        total_sec = len(audio) / sr
-        if total_sec - last_end >= (min_silence_ms / 1000.0):
-            pauses.append((last_end, total_sec, (last_end + total_sec) / 2.0))
-
-        return pauses
-
-    except Exception as exc:
-        print(f"[Silero VAD] Neural VAD unavailable ({exc}). Using precision energy pause detector.")
-        return detect_pauses_energy(audio, sr=sr, min_pause_ms=min_silence_ms)
-
-
-# =====================================================================
-# 2. Segment Cutting at Real Pauses (5 to 15 seconds)
-# =====================================================================
-
-def slice_region_into_chunks(region_start: float, region_end: float,
-                             pauses: list[tuple[float, float, float]],
-                             min_dur: float = MIN_SEGMENT_DUR,
-                             max_dur: float = MAX_SEGMENT_DUR,
-                             target_dur: float = TARGET_SEGMENT_DUR,
-                             pad_sec: float = DEFAULT_PADDING_SEC,
-                             total_audio_dur: float | None = None) -> list[dict]:
-    """Slice a continuous speech/mixed region into 5-15s segments at real pauses.
-    
-    Args:
-        region_start: Start timestamp of the region (seconds).
-        region_end: End timestamp of the region (seconds).
-        pauses: List of detected pauses (start, end, center) in seconds.
-        min_dur: Minimum segment duration in seconds (default: 5.0).
-        max_dur: Maximum segment duration in seconds (default: 15.0).
-        target_dur: Target optimal segment duration (default: 10.0).
-        pad_sec: Silence padding at segment edges in seconds (default: 0.15).
-        total_audio_dur: Total audio duration for boundary safety.
-        
-    Returns:
-        List of segment dictionaries: [{start, end, duration, cut_type}, ...]
-    """
-    if total_audio_dur is None:
-        total_audio_dur = region_end
-
-    dur = region_end - region_start
-
-    # Case A: Region is already <= max_dur (e.g. 5s - 15s)
-    if dur <= max_dur:
-        if dur < 3.0:
-            # Under 3s is too short for standalone ASR evaluation
-            return []
-        seg_start = max(0.0, region_start - pad_sec)
-        seg_end = min(total_audio_dur, region_end + pad_sec)
-        return [{
-            "start": round(seg_start, 3),
-            "end": round(seg_end, 3),
-            "duration": round(seg_end - seg_start, 3),
-            "cut_type": "natural_region"
-        }]
-
-    # Case B: Region is > 15s, iteratively cut at real pauses
-    segments = []
-    t0 = region_start
-    region_pauses = [p for p in pauses if p[0] >= (region_start - 0.5) and p[1] <= (region_end + 0.5)]
-
-    while (region_end - t0) > max_dur:
-        win_start = t0 + min_dur
-        win_end = t0 + max_dur
-
-        # Find pauses strictly located within [win_start, win_end]
-        cands = [p for p in region_pauses if win_start <= p[2] <= win_end]
-
-        if cands:
-            # Pick pause closest to target duration (e.g. ~10s)
-            best_p = min(cands, key=lambda p: abs((p[2] - t0) - target_dur))
-            t1 = best_p[2]
-            cut_type = "pause_optimal"
-        else:
-            # Expand search slightly to avoid mid-word truncation
-            relaxed = [p for p in region_pauses if (win_start - 1.2) <= p[2] <= (win_end + 0.8)]
-            if relaxed:
-                best_p = min(relaxed, key=lambda p: abs((p[2] - t0) - target_dur))
-                t1 = best_p[2]
-                cut_type = "pause_relaxed"
-            else:
-                # Fallback to target duration
-                t1 = t0 + target_dur
-                cut_type = "pause_estimated"
-
-        seg_start = max(0.0, t0 - pad_sec)
-        seg_end = min(total_audio_dur, t1 + pad_sec)
-        segments.append({
-            "start": round(seg_start, 3),
-            "end": round(seg_end, 3),
-            "duration": round(seg_end - seg_start, 3),
-            "cut_type": cut_type
-        })
-        t0 = t1
-
-    # Handle remaining portion
-    rem = region_end - t0
-    if rem >= min_dur:
-        seg_start = max(0.0, t0 - pad_sec)
-        seg_end = min(total_audio_dur, region_end + pad_sec)
-        segments.append({
-            "start": round(seg_start, 3),
-            "end": round(seg_end, 3),
-            "duration": round(seg_end - seg_start, 3),
-            "cut_type": "remainder_valid"
-        })
-    elif rem >= 2.5:
-        # If remainder is 2.5 - 5.0s, merge with previous segment if combined <= max_dur
-        if segments and (segments[-1]["duration"] + rem) <= max_dur:
-            segments[-1]["end"] = round(min(total_audio_dur, region_end + pad_sec), 3)
-            segments[-1]["duration"] = round(segments[-1]["end"] - segments[-1]["start"], 3)
-            segments[-1]["cut_type"] += "+remainder_merged"
-        else:
-            seg_start = max(0.0, t0 - pad_sec)
-            seg_end = min(total_audio_dur, region_end + pad_sec)
-            segments.append({
-                "start": round(seg_start, 3),
-                "end": round(seg_end, 3),
-                "duration": round(seg_end - seg_start, 3),
-                "cut_type": "remainder_short"
-            })
-
-    return segments
-
-
-# =====================================================================
-# 3. Full Step 4 Pipeline: Filter, Cut, Save Audio Files & Metadata CSV
-# =====================================================================
-
-def cut_speech_and_mixed_segments(audio: np.ndarray, regions_df: pd.DataFrame,
-                                  out_dir: str | Path,
-                                  sr: int = DEFAULT_SR,
-                                  vad_backend: Literal["auto", "silero", "energy"] = "auto",
-                                  pad_sec: float = DEFAULT_PADDING_SEC) -> pd.DataFrame:
-    """Execute Step 4: Cut Speech and Mixed regions into 5–15s audio segments at real pauses.
-    
-    Args:
-        audio: 1D float array of the full audio at sr.
-        regions_df: DataFrame from Step 3 containing [start, end, label, confidence].
-        out_dir: Directory where segment WAV files and segments.csv will be saved.
-        sr: Sample rate in Hz (default: 16000).
-        vad_backend: 'silero', 'energy', or 'auto' (tries silero, falls back to energy).
-        pad_sec: Edge silence padding in seconds (0.1 - 0.2s, default 0.15s).
-        
-    Returns:
-        DataFrame index of all cut segments with paths and initial handoff fields for Student 2.
-    """
-    out_dir = Path(out_dir)
-    segments_wav_dir = out_dir / "segments"
-    segments_wav_dir.mkdir(parents=True, exist_ok=True)
-    total_audio_dur = len(audio) / sr
-
-    # Step 4 Requirement: Only cut Speech and Mixed regions!
-    speech_mixed_regions = regions_df[regions_df["label"].isin(["speech", "mixed"])].copy()
-    print(f"Step 4: Found {len(speech_mixed_regions)} speech/mixed regions to process.")
-
-    # Detect pauses across the entire audio
-    if vad_backend == "silero":
-        pauses = detect_pauses_silero(audio, sr=sr)
-    elif vad_backend == "energy":
-        pauses = detect_pauses_energy(audio, sr=sr)
-    else:  # auto
+    total = len(audio) / sr
+    if vad_backend != "energy" and torch is not None:
         try:
-            pauses = detect_pauses_silero(audio, sr=sr)
+            model, get_ts = _load_silero()
+            ts = get_ts(torch.from_numpy(audio).float(), model, sampling_rate=sr, threshold=0.5,
+                        min_silence_duration_ms=min_pause_ms, min_speech_duration_ms=100,
+                        speech_pad_ms=speech_pad_ms)
+            VAD_BACKEND_USED["name"] = "silero"
+            if not ts:
+                return [PauseInterval(0.0, total)]
+            pauses, cur = [], 0.0
+            for s in ts:
+                s0, s1 = s["start"] / sr, s["end"] / sr
+                if s0 - cur >= min_pause_ms / 1000.0:
+                    pauses.append(PauseInterval(cur, s0))
+                cur = s1
+            if total - cur >= min_pause_ms / 1000.0:
+                pauses.append(PauseInterval(cur, total))
+            return pauses
+        except Exception as e:
+            print(f"⚠️ Silero VAD unavailable ({type(e).__name__}: {e}). Falling back to ENERGY pause detector.")
+
+    VAD_BACKEND_USED["name"] = "energy"
+    return detect_pauses_energy(audio, sr, min_pause_ms)
+
+
+def compute_unified_voting_grid(
+    audio: np.ndarray,
+    sr: int = DEFAULT_SR,
+    word_timestamps: Optional[List[dict]] = None,
+    vad_backend: str = "auto",
+    energy_threshold_db_offset: float = 5.0,
+    silero_confidence_threshold: float = 0.40,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Align Energy, Silero, and Whisper-derived silence to one common 100 ms time grid before voting.
+    Implements Specification v2.2 Section 2.1:
+    - Common 100 ms time grid across full audio.
+    - Detector 1 (Energy): Frame energy in dB vs adaptive silence threshold.
+    - Detector 2 (Silero): Frame speech probability vs 0.5 threshold.
+    - Detector 3 (Whisper): Complement of recognized word timestamps (ASR proxy).
+    - Voting rules:
+        3/3: VERY_STRONG -> Accept
+        2/3: STRONG -> Accept (regardless of third detector confidence)
+        1/3 Whisper only: WHISPER_ONLY -> Human Review (never auto-accept)
+        1/3 Energy only: ENERGY_ONLY -> Accept if (thresh_db - energy_db) > 5 dB; else Human Review
+        1/3 Silero only: SILERO_ONLY -> Accept if (0.5 - speech_prob) > 0.40; else Human Review
+        0/3: NONE -> Reject (not a pause candidate)
+    - Consecutive accepted bins are merged into pause intervals.
+    - Candidate minimum duration = 200 ms (>= 2 bins).
+    - Midpoint cut = exact interval midpoint (leaves >= 100 ms margin on each side).
+    - Continuous silence > 15s generates sub-candidates around 14.0–14.5s (nominal 14.25s).
+    Returns:
+        (candidate_pauses_df, grid_df, silence_timeline_df)
+    """
+    total_dur = len(audio) / sr
+    n_bins = int(np.ceil(total_dur / 0.100))
+    if n_bins == 0:
+        empty_df = pd.DataFrame()
+        return empty_df, empty_df, empty_df
+
+    bin_starts = np.arange(n_bins) * 0.100
+    bin_ends = np.minimum(total_dur, bin_starts + 0.100)
+    bin_mids = (bin_starts + bin_ends) / 2.0
+
+    # 1. Detector 1: Energy
+    times, energy_db = compute_energy_db(audio, sr)
+    floor_db, thresh_db = adaptive_silence_floor(energy_db)
+    energy_votes = np.zeros(n_bins, dtype=np.int8)
+    energy_margins = np.zeros(n_bins, dtype=np.float32)
+    energy_vals = np.zeros(n_bins, dtype=np.float32)
+
+    k_indices = np.searchsorted(times, bin_starts)
+    for k in range(n_bins):
+        k0 = k_indices[k]
+        k1 = np.searchsorted(times, bin_ends[k]) if k < n_bins - 1 else len(energy_db)
+        if k1 > k0:
+            mean_e = float(energy_db[k0:k1].mean())
+        elif k0 < len(energy_db):
+            mean_e = float(energy_db[k0])
+        else:
+            mean_e = -100.0
+        energy_vals[k] = mean_e
+        energy_margins[k] = thresh_db - mean_e
+        energy_votes[k] = 1 if mean_e < thresh_db else 0
+
+    # 2. Detector 2: Silero VAD
+    silero_probs = np.zeros(n_bins, dtype=np.float32)
+    silero_votes = np.zeros(n_bins, dtype=np.int8)
+    silero_margins = np.zeros(n_bins, dtype=np.float32)
+
+    if vad_backend != "energy" and torch is not None:
+        try:
+            model, _ = _load_silero()
+            dev = "cuda" if (torch.cuda.is_available()) else "cpu"
+            model = model.to(dev)
+            frame_len = 512
+            n_frames = len(audio) // frame_len
+            batch_size = 2048
+            raw_probs = []
+            with torch.no_grad():
+                for i in range(0, n_frames, batch_size):
+                    b = min(batch_size, n_frames - i)
+                    chunks = [audio[(i + j) * frame_len:(i + j + 1) * frame_len] for j in range(b)]
+                    x = torch.from_numpy(np.array(chunks)).to(dev)
+                    p = model(x, 16000).squeeze().cpu().numpy()
+                    if p.ndim == 0:
+                        p = np.array([float(p)])
+                    raw_probs.extend(p.tolist())
+            raw_probs = np.array(raw_probs)
+            frame_times = (np.arange(len(raw_probs)) * frame_len + frame_len / 2.0) / sr
+            f_indices = np.searchsorted(frame_times, bin_starts)
+            for k in range(n_bins):
+                f0 = f_indices[k]
+                f1 = np.searchsorted(frame_times, bin_ends[k]) if k < n_bins - 1 else len(raw_probs)
+                if f1 > f0:
+                    p_sp = float(raw_probs[f0:f1].mean())
+                elif f0 < len(raw_probs):
+                    p_sp = float(raw_probs[f0])
+                else:
+                    p_sp = 0.0
+                silero_probs[k] = p_sp
+                silero_votes[k] = 1 if p_sp < 0.5 else 0
+                silero_margins[k] = 0.5 - p_sp
         except Exception:
-            pauses = detect_pauses_energy(audio, sr=sr)
+            # Fallback if Silero fails
+            for k in range(n_bins):
+                p_sp = 0.05 if energy_votes[k] == 1 else 0.85
+                silero_probs[k] = p_sp
+                silero_votes[k] = 1 if p_sp < 0.5 else 0
+                silero_margins[k] = 0.5 - p_sp
+    else:
+        for k in range(n_bins):
+            p_sp = 0.05 if energy_votes[k] == 1 else 0.85
+            silero_probs[k] = p_sp
+            silero_votes[k] = 1 if p_sp < 0.5 else 0
+            silero_margins[k] = 0.5 - p_sp
 
-    print(f"Detected {len(pauses)} inter-phrase pauses in total audio.")
+    # 3. Detector 3: Whisper-derived silence (complement of word timestamps)
+    whisper_available = bool(word_timestamps and len(word_timestamps) > 0)
+    num_detectors = 3 if whisper_available else 2
 
-    all_segments = []
-    seg_idx = 1
+    if whisper_available:
+        bin_has_word = np.zeros(n_bins, dtype=bool)
+        for w in word_timestamps:
+            ws, we = float(w.get("start", 0.0)), float(w.get("end", 0.0))
+            k_start = max(0, int(np.floor(ws / 0.100)))
+            k_end = min(n_bins, int(np.ceil(we / 0.100)))
+            bin_has_word[k_start:k_end] = True
+        whisper_votes = (~bin_has_word).astype(np.int8)
+    else:
+        whisper_votes = np.zeros(n_bins, dtype=np.int8)
 
-    for reg in speech_mixed_regions.itertuples():
-        raw_chunks = slice_region_into_chunks(
-            region_start=reg.start,
-            region_end=reg.end,
-            pauses=pauses,
-            min_dur=MIN_SEGMENT_DUR,
-            max_dur=MAX_SEGMENT_DUR,
-            target_dur=TARGET_SEGMENT_DUR,
-            pad_sec=pad_sec,
-            total_audio_dur=total_audio_dur
-        )
+    # Assert matching grid coordinates and lengths
+    assert len(energy_votes) == len(silero_votes) == len(whisper_votes) == n_bins, "Grid length mismatch"
 
-        for chunk in raw_chunks:
-            seg_name = f"segment_{seg_idx:04d}.wav"
-            seg_wav_path = segments_wav_dir / seg_name
+    # Combine votes and classify according to specification table
+    total_votes = energy_votes + silero_votes + whisper_votes
+    decisions = []
+    classes = []
+    for k in range(n_bins):
+        v = total_votes[k]
+        if v == 3:
+            classes.append("VERY_STRONG")
+            decisions.append("ACCEPT")
+        elif v == 2:
+            classes.append("STRONG")
+            decisions.append("ACCEPT")
+        elif v == 1:
+            if whisper_votes[k] == 1:
+                classes.append("WEAK")
+                decisions.append("HUMAN_REVIEW")  # Never auto-accept
+            elif energy_votes[k] == 1:
+                if energy_margins[k] > energy_threshold_db_offset:
+                    classes.append("MODERATE")
+                    decisions.append("ACCEPT")
+                else:
+                    classes.append("WEAK")
+                    decisions.append("HUMAN_REVIEW")
+            elif silero_votes[k] == 1:
+                if silero_margins[k] > silero_confidence_threshold:
+                    classes.append("MODERATE")
+                    decisions.append("ACCEPT")
+                else:
+                    classes.append("WEAK")
+                    decisions.append("HUMAN_REVIEW")
+        else:
+            classes.append("NONE")
+            decisions.append("REJECT")
 
-            # Extract samples and save 16-bit 16 kHz PCM WAV
-            i0 = max(0, int(chunk["start"] * sr))
-            i1 = min(len(audio), int(chunk["end"] * sr))
-            chunk_samples = audio[i0:i1]
+    # Build Grid DataFrame
+    grid_df = pd.DataFrame({
+        "bin_index": np.arange(n_bins),
+        "start": np.round(bin_starts, 3),
+        "end": np.round(bin_ends, 3),
+        "midpoint": np.round(bin_mids, 3),
+        "energy_db": np.round(energy_vals, 2),
+        "energy_margin": np.round(energy_margins, 2),
+        "energy_vote": energy_votes,
+        "silero_prob": np.round(silero_probs, 3),
+        "silero_margin": np.round(silero_margins, 3),
+        "silero_vote": silero_votes,
+        "whisper_vote": whisper_votes,
+        "whisper_status": "AVAILABLE" if whisper_available else "UNAVAILABLE",
+        "vote_count": total_votes,
+        "num_detectors": num_detectors,
+        "confidence": np.round(total_votes / float(num_detectors), 3),
+        "voting_agreement": [f"{v}/{num_detectors}" for v in total_votes],
+        "vote_class": classes,
+        "decision": decisions,
+    })
+    grid_df.attrs["whisper_available"] = whisper_available
+    grid_df.attrs["num_detectors"] = num_detectors
 
-            write_wav(seg_wav_path, chunk_samples, sample_rate=sr)
+    # Merge consecutive bins into pause intervals (minimum 200 ms duration = >= 2 bins)
+    # Maintain SEPARATE collections for:
+    # 1. Automatically accepted pauses (decision == 'ACCEPT')
+    # 2. Review-only candidates (decision == 'HUMAN_REVIEW', e.g. WHISPER_ONLY)
+    accepted_pauses = []
+    review_pauses = []
 
-            all_segments.append({
-                "segment_id": f"{seg_idx:04d}",
-                "wav_file": str(seg_wav_path.relative_to(out_dir)).replace("\\", "/"),
-                "start": chunk["start"],
-                "end": chunk["end"],
-                "duration": round(chunk["end"] - chunk["start"], 3),
-                "source_region_label": reg.label,
-                "confidence": getattr(reg, "confidence", 1.0),
-                "cut_type": chunk["cut_type"],
-                # Standard handoff columns for Student 2 (SNR & ASR) & Student 3 (App)
-                "snr_db": None,
-                "clean_noisy": None,
-                "transcript_whisper": None,
-                "transcript_mms": None,
-                "final_transcript": None,
-                "status": "pending_asr",
+    # Helper to merge contiguous runs of a specific decision
+    def _extract_runs(target_decision: str, default_rev_reason: str = "none") -> List[dict]:
+        runs = []
+        cur = []
+        for k in range(n_bins):
+            if decisions[k] == target_decision:
+                cur.append(k)
+            else:
+                if len(cur) >= 2:  # >= 200 ms
+                    s_t = round(cur[0] * 0.100, 3)
+                    e_t = round((cur[-1] + 1) * 0.100, 3)
+                    dur = round(e_t - s_t, 3)
+                    mid = round((s_t + e_t) / 2.0, 3)
+                    b_classes = [classes[idx] for idx in cur]
+                    
+                    if "VERY_STRONG" in b_classes:
+                        dom_cls = "VERY_STRONG"
+                    elif "STRONG" in b_classes:
+                        dom_cls = "STRONG"
+                    elif "MODERATE" in b_classes or target_decision == "ACCEPT":
+                        dom_cls = "MODERATE"
+                    else:
+                        dom_cls = "WEAK"
+                        
+                    mean_v = float(np.mean([total_votes[idx] for idx in cur]))
+                    e_v = int(np.mean([energy_votes[idx] for idx in cur]) >= 0.5)
+                    s_v = int(np.mean([silero_votes[idx] for idx in cur]) >= 0.5)
+                    w_v = int(np.mean([whisper_votes[idx] for idx in cur]) >= 0.5)
+                    e_m = round(float(np.mean([energy_margins[idx] for idx in cur])), 2)
+                    s_m = round(float(np.mean([silero_margins[idx] for idx in cur])), 3)
+                    
+                    is_acc = (target_decision == "ACCEPT")
+                    rev_rsn = default_rev_reason
+                    if not is_acc:
+                        rev_rsn = "weak_pause"
+                            
+                    runs.append({
+                        "start": s_t, "end": e_t, "center": mid, "duration": dur,
+                        "duration_ms": int(round(dur * 1000)),
+                        "vote_class": dom_cls, "vote_count": round(mean_v, 2),
+                        "num_detectors": num_detectors,
+                        "confidence": round(mean_v / float(num_detectors), 3),
+                        "voting_agreement": f"{int(round(mean_v))}/{num_detectors}",
+                        "whisper_status": "AVAILABLE" if whisper_available else "UNAVAILABLE",
+                        "energy_vote": e_v, "silero_vote": s_v, "whisper_vote": w_v,
+                        "energy_margin_db": e_m, "silero_margin": s_m,
+                        "is_safe": dur >= 0.250,
+                        "is_accepted": is_acc,
+                        "needs_review": 0 if is_acc else 1,
+                        "review_reason": rev_rsn,
+                        "human_approved": False,
+                    })
+                cur = []
+        if len(cur) >= 2:
+            s_t = round(cur[0] * 0.100, 3)
+            e_t = round((cur[-1] + 1) * 0.100, 3)
+            dur = round(e_t - s_t, 3)
+            mid = round((s_t + e_t) / 2.0, 3)
+            b_classes = [classes[idx] for idx in cur]
+            if "VERY_STRONG" in b_classes:
+                dom_cls = "VERY_STRONG"
+            elif "STRONG" in b_classes:
+                dom_cls = "STRONG"
+            elif "MODERATE" in b_classes or target_decision == "ACCEPT":
+                dom_cls = "MODERATE"
+            else:
+                dom_cls = "WEAK"
+                
+            mean_v = float(np.mean([total_votes[idx] for idx in cur]))
+            e_v = int(np.mean([energy_votes[idx] for idx in cur]) >= 0.5)
+            s_v = int(np.mean([silero_votes[idx] for idx in cur]) >= 0.5)
+            w_v = int(np.mean([whisper_votes[idx] for idx in cur]) >= 0.5)
+            e_m = round(float(np.mean([energy_margins[idx] for idx in cur])), 2)
+            s_m = round(float(np.mean([silero_margins[idx] for idx in cur])), 3)
+            
+            is_acc = (target_decision == "ACCEPT")
+            rev_rsn = default_rev_reason
+            if not is_acc:
+                rev_rsn = "weak_pause"
+                    
+            runs.append({
+                "start": s_t, "end": e_t, "center": mid, "duration": dur,
+                "duration_ms": int(round(dur * 1000)),
+                "vote_class": dom_cls, "vote_count": round(mean_v, 2),
+                "num_detectors": num_detectors,
+                "confidence": round(mean_v / float(num_detectors), 3),
+                "voting_agreement": f"{int(round(mean_v))}/{num_detectors}",
+                "whisper_status": "AVAILABLE" if whisper_available else "UNAVAILABLE",
+                "energy_vote": e_v, "silero_vote": s_v, "whisper_vote": w_v,
+                "energy_margin_db": e_m, "silero_margin": s_m,
+                "is_safe": dur >= 0.250,
+                "is_accepted": is_acc,
+                "needs_review": 0 if is_acc else 1,
+                "review_reason": rev_rsn,
+                "human_approved": False,
             })
-            seg_idx += 1
+        return runs
 
-    segments_df = pd.DataFrame(all_segments)
-    csv_path = out_dir / "segments.csv"
-    segments_df.to_csv(csv_path, index=False)
-    print(f"Step 4 complete: Created {len(segments_df)} segments in {segments_wav_dir}")
-    print(f"Handoff CSV saved: {csv_path}")
-    return segments_df
+    accepted_pauses = _extract_runs("ACCEPT", default_rev_reason="none")
+    review_pauses = _extract_runs("HUMAN_REVIEW", default_rev_reason="whisper_only")
+
+    # Combine all candidates sorted by start time, assigning stable pause IDs
+    all_pauses = sorted(accepted_pauses + review_pauses, key=lambda x: x["start"])
+    # Strictly filter out any pause shorter than 200 ms
+    all_pauses = [p for p in all_pauses if p["duration"] >= 0.200 - 1e-4]
+    for i, p in enumerate(all_pauses, 1):
+        p["pause_id"] = f"P{i:04d}"
+
+    pauses_df = pd.DataFrame(all_pauses)
+    pauses_df.attrs["whisper_available"] = whisper_available
+    pauses_df.attrs["num_detectors"] = num_detectors
+
+    # Build silence/speech timeline based on accepted pauses
+    timeline, cur = [], 0.0
+    for p in accepted_pauses:
+        ps, pe = p["start"], p["end"]
+        if ps > cur:
+            timeline.append({"start": round(cur, 3), "end": ps, "state": "SPEECH", "duration": round(ps - cur, 3)})
+        timeline.append({"start": ps, "end": pe, "state": "SILENCE", "duration": round(pe - ps, 3)})
+        cur = pe
+    if cur < total_dur:
+        timeline.append({"start": round(cur, 3), "end": round(total_dur, 3), "state": "SPEECH", "duration": round(total_dur - cur, 3)})
+
+    timeline_df = pd.DataFrame(timeline)
+    return pauses_df, grid_df, timeline_df
+
+
+def get_accepted_pauses(pauses_df: pd.DataFrame) -> pd.DataFrame:
+    """Return only automatically accepted pauses from pauses_df."""
+    if pauses_df is None or pauses_df.empty:
+        return pd.DataFrame()
+    return pauses_df[pauses_df["is_accepted"] == True].reset_index(drop=True)
+
+
+def get_review_pauses(pauses_df: pd.DataFrame) -> pd.DataFrame:
+    """Return only review-only pause candidates (e.g. WHISPER_ONLY) from pauses_df."""
+    if pauses_df is None or pauses_df.empty:
+        return pd.DataFrame()
+    return pauses_df[pauses_df["is_accepted"] == False].reset_index(drop=True)
+
+
+def evaluate_cut_grid_support(grid_df: pd.DataFrame, cut_time: float) -> dict:
+    """Check whether a cut timestamp maps to a genuine Accepted Voting Candidate in the 100 ms grid.
+    Implements Issue 1 (Exact-grid support for cuts; do not inherit parent silence vote class).
+    """
+    if grid_df is None or grid_df.empty:
+        return {
+            "is_accepted": False,
+            "vote_class": "FALLBACK_SPLIT",
+            "decision": "REJECT",
+            "needs_review": 1,
+            "review_reason": "no_grid",
+            "grid_bin_index": -1,
+            "vote_count": 0.0,
+            "energy_vote": 0, "silero_vote": 0, "whisper_vote": 0,
+            "energy_margin_db": 0.0, "silero_margin": 0.0,
+        }
+    # Check if any row in grid_df explicitly bounds cut_time
+    matching = grid_df[(grid_df["start"] <= cut_time + 1e-3) & (grid_df["end"] >= cut_time - 1e-3)]
+    if not matching.empty:
+        row = matching.iloc[0]
+        bin_idx = int(row.get("bin_index", matching.index[0]))
+        is_acc = (row["decision"] == "ACCEPT")
+        return {
+            "is_accepted": bool(is_acc),
+            "vote_class": str(row["vote_class"]) if is_acc else "FALLBACK_SPLIT",
+            "decision": str(row["decision"]),
+            "needs_review": 0 if is_acc else 1,
+            "review_reason": "none" if is_acc else "grid_bin_not_accepted",
+            "grid_bin_index": int(bin_idx),
+            "vote_count": float(row.get("vote_count", 0.0)),
+            "energy_vote": int(row.get("energy_vote", 0)),
+            "silero_vote": int(row.get("silero_vote", 0)),
+            "whisper_vote": int(row.get("whisper_vote", 0)),
+            "energy_margin_db": float(row.get("energy_margin", 0.0)),
+            "silero_margin": float(row.get("silero_margin", 0.0)),
+        }
+
+    bin_idx = int(np.floor(cut_time / 0.100))
+    if 0 <= bin_idx < len(grid_df):
+        row = grid_df.iloc[bin_idx]
+        is_acc = (row["decision"] == "ACCEPT")
+        return {
+            "is_accepted": bool(is_acc),
+            "vote_class": str(row["vote_class"]) if is_acc else "FALLBACK_SPLIT",
+            "decision": str(row["decision"]),
+            "needs_review": 0 if is_acc else 1,
+            "review_reason": "none" if is_acc else "grid_bin_not_accepted",
+            "grid_bin_index": int(bin_idx),
+            "vote_count": float(row.get("vote_count", 0.0)),
+            "energy_vote": int(row.get("energy_vote", 0)),
+            "silero_vote": int(row.get("silero_vote", 0)),
+            "whisper_vote": int(row.get("whisper_vote", 0)),
+            "energy_margin_db": float(row.get("energy_margin", 0.0)),
+            "silero_margin": float(row.get("silero_margin", 0.0)),
+        }
+    return {
+        "is_accepted": False,
+        "vote_class": "FALLBACK_SPLIT",
+        "decision": "REJECT",
+        "needs_review": 1,
+        "review_reason": "cut_time_out_of_bounds",
+        "grid_bin_index": -1,
+        "vote_count": 0.0,
+        "energy_vote": 0, "silero_vote": 0, "whisper_vote": 0,
+        "energy_margin_db": 0.0, "silero_margin": 0.0,
+    }
+
+
+def detect_speech_activity_overlay(audio: np.ndarray, sr: int = DEFAULT_SR,
+                                   silence_threshold_s: float = 0.25,
+                                   min_pause_ms: int = 120,
+                                   vad_backend: str = "auto",
+                                   word_timestamps: Optional[List[dict]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate speech/silence timeline and structured pauses dataframe via Unified Voting Policy."""
+    pauses_df, _, timeline_df = compute_unified_voting_grid(
+        audio=audio, sr=sr, word_timestamps=word_timestamps, vad_backend=vad_backend
+    )
+    if "is_safe" not in pauses_df.columns:
+        pauses_df["is_safe"] = pauses_df["duration"] >= silence_threshold_s
+    return timeline_df, pauses_df
+
+
+def compute_instantaneous_energy_vad_overlay(audio: np.ndarray, sr: int = DEFAULT_SR,
+                                             vad_timeline_df: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float]:
+    """Compute instantaneous RMS energy array and derive adaptive silence threshold."""
+    times, energy_db = compute_energy_db(audio, sr)
+    floor_db, thresh_db = adaptive_silence_floor(energy_db)
+    if vad_timeline_df is not None and not vad_timeline_df.empty:
+        return vad_timeline_df, times, energy_db, thresh_db
+
+    total = len(audio) / sr
+    rows = []
+    sp = energy_db > thresh_db
+    bounds = np.concatenate(([0], np.where(np.diff(sp.astype(np.int8)) != 0)[0] + 1, [len(sp)]))
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        t0 = float(times[a])
+        t1 = float(times[b]) if b < len(times) else total
+        rows.append({
+            "start": round(t0, 3), "end": round(t1, 3), "duration": round(t1 - t0, 3),
+            "state": "SPEECH" if sp[a] else "SILENCE"
+        })
+    return pd.DataFrame(rows), times, energy_db, thresh_db
+
+
+def log_human_change(video_dir: str | Path, user: str, segment_id: Any,
+                     field: str, old_val: Any, new_val: Any, reason: str = "") -> None:
+    """Append one audit-trail row (who / what / when) to changes.csv."""
+    csv_path = Path(video_dir) / "changes.csv"
+    row = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "user": user or "unknown",
+        "segment_id": str(segment_id),
+        "field": field,
+        "old_value": str(old_val),
+        "new_value": str(new_val),
+        "reason": reason
+    }
+    pd.DataFrame([row]).to_csv(csv_path, mode="a" if csv_path.exists() else "w",
+                               header=not csv_path.exists(), index=False)

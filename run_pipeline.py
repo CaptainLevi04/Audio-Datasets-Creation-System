@@ -43,9 +43,9 @@ def main():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["heuristic", "panns"],
-        default="heuristic",
-        help="Region classification backend for Step 3 (default: heuristic).",
+        choices=["ast", "heuristic", "panns"],
+        default="ast",
+        help="Region classification backend for Step 3 (default: ast).",
     )
     parser.add_argument(
         "--vad",
@@ -57,8 +57,15 @@ def main():
     parser.add_argument(
         "--max-height",
         type=int,
-        default=480,
-        help="Maximum video height for yt-dlp download (default: 480).",
+        default=360,
+        help="Maximum video height for yt-dlp download (default: 360, fast & small).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Device for AST neural model execution (default: auto).",
     )
     parser.add_argument(
         "--cut-video",
@@ -71,13 +78,14 @@ def main():
     if args.demo:
         demo_dir = Path(args.out_dir) / "demo_run"
         print(f"Running instant mock demo in: {demo_dir}")
-        res = run_mock_pipeline(out_dir=demo_dir)
+        res = run_mock_pipeline(out_dir=demo_dir, backend=args.backend)
         print("\nDemo completed successfully!")
         print(f"Regions and segments created in: {res['out_dir']}")
         return
 
     source = args.url if args.url else args.file
     is_url = bool(args.url)
+    device = None if args.device == "auto" else args.device
 
     res = run_student1_pipeline(
         source=source,
@@ -87,6 +95,7 @@ def main():
         vad_backend=args.vad,
         max_height=args.max_height,
         cut_video=args.cut_video,
+        device=device,
     )
     print("\nExecution finished with status:", res["status"])
 

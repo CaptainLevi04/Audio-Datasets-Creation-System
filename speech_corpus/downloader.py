@@ -1,137 +1,154 @@
 """Step 1: Video downloader and metadata extractor.
 Supports online video URLs (via yt-dlp) and local files.
 Collects link, title, channel, duration, license, and creative_commons status.
+Saves info.json compliant with project specification.
 """
 
 from pathlib import Path
+import json
 import re
 import shutil
+import time
+from typing import Optional, Tuple
+
+from .audio import DEFAULT_SR, extract_audio, extract_audio_hq, read_wav, write_wav
 
 
-def is_creative_commons(license_str: str | None) -> bool:
-    """Check if the license string indicates Creative Commons or Public Domain."""
-    if not license_str:
-        return False
-    norm = license_str.lower()
-    return "creative commons" in norm or "cc-by" in norm or "public domain" in norm
+def is_creative_commons(license_str_or_meta) -> bool:
+    """True only if yt-dlp's metadata indicates Creative Commons (no loose substring match)."""
+    if isinstance(license_str_or_meta, dict):
+        lic = str(license_str_or_meta.get("license") or "").lower()
+    else:
+        lic = str(license_str_or_meta or "").lower()
+    return "creative commons" in lic or "cc-by" in lic or "public domain" in lic
 
 
-def download_video(url: str, out_dir: str | Path, max_height: int | None = 480) -> tuple[Path, dict]:
-    """Download a video via yt-dlp and extract full metadata.
+def extract_video_id(url_or_path: str) -> str:
+    """Extract YouTube 11-char ID or sanitize local filename."""
+    m = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:\?|&|$|\/)", url_or_path)
+    if m:
+        return m.group(1)
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", Path(url_or_path).stem)
+    return name[:32] if name else "sample_video"
+
+
+def _save_info(out_dir: Path, info: dict) -> dict:
+    """Write info.json to out_dir and return info dict."""
+    (out_dir / "info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    return info
+
+
+def find_cached_video(url: str, search_dirs: list = None) -> Optional[Tuple[Path, dict]]:
+    """Check if the video URL was already downloaded previously on the local machine."""
+    vid_id = extract_video_id(url)
+    if search_dirs is None:
+        search_dirs = [Path("data"), Path("../data")]
+
+    for s_dir in search_dirs:
+        s_dir = Path(s_dir)
+        if not s_dir.exists():
+            continue
+        cand_dir = s_dir / vid_id
+        if cand_dir.exists() and (cand_dir / "audio.wav").exists():
+            info_file = cand_dir / "info.json"
+            if info_file.exists():
+                try:
+                    meta = json.loads(info_file.read_text(encoding="utf-8"))
+                    return cand_dir / "audio.wav", meta
+                except Exception:
+                    pass
+    return None
+
+
+def download_video(url: str, out_dir: str | Path, max_duration: Optional[int] = None,
+                   cookies_file: Optional[str | Path] = None) -> Tuple[Path, dict]:
+    """Download best audio stream via yt-dlp, convert to 16 kHz WAV, save info.json.
     
     Args:
-        url: Direct video URL (YouTube, Vimeo, etc.).
-        out_dir: Destination folder.
-        max_height: Maximum video vertical resolution (e.g., 480).
-                    Restricting height significantly saves bandwidth and disk space
-                    while preserving 100% of the original audio quality.
-                    
+        url: YouTube video URL.
+        out_dir: Target output directory.
+        max_duration: Optional duration limit in seconds.
+        cookies_file: Path to cookies.txt to bypass YouTube bot blocks on Colab.
+        
     Returns:
-        (video_path, metadata_dict)
+        (wav_path, info_dict)
     """
     try:
         import yt_dlp
     except ImportError:
-        raise ImportError(
-            "yt-dlp is required for downloading videos. Install it with: pip install yt-dlp"
-        )
+        raise ImportError("yt-dlp is required. Install with: pip install yt-dlp")
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    wav_path, info_path = out_dir / "audio.wav", out_dir / "info.json"
 
-    if max_height:
-        fmt = (f"bv*[vcodec^=avc1][height<={max_height}]+ba"
-               f"/bv*[height<={max_height}]+ba/bv*+ba/b")
-    else:
-        fmt = "bv*[vcodec^=avc1]+ba/bv*+ba/b"
+    if wav_path.exists() and info_path.exists():
+        print(f"⚡ Cached audio + info found in {out_dir}")
+        return wav_path, json.loads(info_path.read_text(encoding="utf-8"))
 
-    opts = {
-        "format": fmt,
-        "outtmpl": str(out_dir / "video.%(ext)s"),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [_download_progress],
-    }
+    base = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if cookies_file:
+        base["cookiefile"] = str(cookies_file)
 
-    print(f"Fetching metadata and downloading: {url}")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        video_path = Path(ydl.prepare_filename(info))
+    with yt_dlp.YoutubeDL(base) as ydl:
+        meta = ydl.extract_info(url, download=False)
 
-    if not video_path.exists():
-        found = sorted(out_dir.glob("video.*"))
-        if not found:
-            raise RuntimeError(f"Download completed but output video file was not found in {out_dir}")
-        video_path = found[0]
+    dur = meta.get("duration")
+    if max_duration and dur and dur > max_duration:
+        raise ValueError(f"Video is {dur}s, longer than max_duration={max_duration}s")
 
-    fmts = info.get("requested_formats") or [info]
-    src_audio = next((f for f in fmts if f.get("acodec") not in (None, "none")), {})
-
-    meta = {
-        "video_id": info.get("id") or "custom_video",
+    info = {
+        "video_id": extract_video_id(url),
+        "source": "youtube",
         "url": url,
-        "webpage_url": info.get("webpage_url") or url,
-        "title": info.get("title") or "Unknown Title",
-        "channel": info.get("channel") or info.get("uploader") or "Unknown Channel",
-        "duration_sec": info.get("duration") or 0,
-        "license": info.get("license") or "Standard YouTube License",
-        "creative_commons": is_creative_commons(info.get("license")),
-        "upload_date": info.get("upload_date"),
-        "language": info.get("language"),
-        "source_audio_codec": src_audio.get("acodec"),
-        "source_audio_bitrate_kbps": src_audio.get("abr"),
-        "source_audio_sample_rate": src_audio.get("asr"),
+        "webpage_url": meta.get("webpage_url") or url,
+        "title": meta.get("title") or "Unknown Title",
+        "channel": meta.get("channel") or meta.get("uploader") or "Unknown Channel",
+        "duration_s": dur,
+        "upload_date": meta.get("upload_date"),
+        "license": meta.get("license") or "Standard YouTube License",
+        "is_creative_commons": is_creative_commons(meta),
+        "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    return video_path, meta
+    if not info["is_creative_commons"]:
+        print(f"⚠️ License is '{info['license']}', not Creative Commons. Document this in the report.")
+
+    if not wav_path.exists():
+        opts = dict(base, format="bestaudio/best", outtmpl=str(out_dir / "temp_video.%(ext)s"))
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        temp = list(out_dir.glob("temp_video.*"))
+        if not temp:
+            raise RuntimeError("yt-dlp produced no file (on Colab: YouTube may block the IP; pass cookies_file or upload audio).")
+        extract_audio_hq(temp[0], wav_path)
+        for f in temp:
+            f.unlink(missing_ok=True)
+
+    _save_info(out_dir, info)
+    return wav_path, info
 
 
-def process_local_file(file_path: str | Path, out_dir: str | Path) -> tuple[Path, dict]:
-    """Ingest a local video or audio file for the pipeline without downloading.
-    
-    Args:
-        file_path: Path to local media file.
-        out_dir: Destination folder.
-        
-    Returns:
-        (copied_video_path, metadata_dict)
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Local file not found: {file_path}")
-
-    out_dir = Path(out_dir)
+def ingest_local_file(src: str | Path, out_dir: str | Path) -> Tuple[Path, dict]:
+    """Ingest a local audio/video file instead of a URL. Returns (wav_path, info_dict)."""
+    src, out_dir = Path(src), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
-    target_path = out_dir / f"video{file_path.suffix}"
-    if file_path.resolve() != target_path.resolve():
-        shutil.copy2(file_path, target_path)
-
-    clean_stem = re.sub(r"[^\w\-]", "_", file_path.stem)
-    meta = {
-        "video_id": clean_stem,
-        "url": f"file:///{file_path.resolve().as_posix()}",
-        "webpage_url": f"file:///{file_path.resolve().as_posix()}",
-        "title": file_path.name,
+    wav_path = extract_audio_hq(src, out_dir / "audio.wav")
+    import soundfile as sf
+    dur = sf.info(str(wav_path)).duration
+    info = {
+        "video_id": out_dir.name,
+        "source": "local_file",
+        "url": str(src.resolve() if hasattr(src, "resolve") else src),
+        "title": Path(src).name,
         "channel": "Local User",
-        "duration_sec": None,
+        "duration_s": round(dur, 2),
         "license": "Local / Custom",
-        "creative_commons": False,
-        "upload_date": None,
-        "language": "ara",
-        "source_audio_codec": "local",
-        "source_audio_bitrate_kbps": None,
-        "source_audio_sample_rate": None,
+        "is_creative_commons": False,
+        "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    return target_path, meta
+    return wav_path, _save_info(out_dir, info)
 
 
-def _download_progress(d):
-    if d["status"] == "downloading":
-        pct = d.get("_percent_str", "").strip()
-        speed = d.get("_speed_str", "").strip()
-        eta = d.get("_eta_str", "").strip()
-        print(f"\r  [yt-dlp] Downloading: {pct} | Speed: {speed} | ETA: {eta}    ", end="", flush=True)
-    elif d["status"] == "finished":
-        print("\r  [yt-dlp] Download finished successfully.                            ")
+def process_local_file(file_path: str | Path, out_dir: str | Path) -> Tuple[Path, dict]:
+    """Backward-compatible alias for ingest_local_file."""
+    return ingest_local_file(file_path, out_dir)
