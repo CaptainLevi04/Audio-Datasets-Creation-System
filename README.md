@@ -1,8 +1,3 @@
-# Building a Labelled Speech Corpus: Audio Engineering Pipeline (Steps 1–4)
-
-**Course Project:** Building a Labelled Speech Corpus from Online Videos  
-**Supervisor:** Prof. Mohsen Rashwan  
-**Author:** Amr Gamal ([@CaptainLevi04](https://github.com/CaptainLevi04))
 
 ---
 
