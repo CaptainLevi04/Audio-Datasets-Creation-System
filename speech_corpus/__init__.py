@@ -99,6 +99,16 @@ from .inspector import (
     sample_manual_check_window,
     summarize_manual_check,
 )
+from .segment_editor import (
+    launch_segment_editor,
+    plot_segments_window,
+    segment_add,
+    segment_delete,
+    segment_merge,
+    segment_move,
+    segment_split,
+    sync_segments_to_disk,
+)
 from .quality_control import (
     build_corpus_manifest,
     generate_qc_markdown_report,
@@ -179,6 +189,14 @@ __all__ = [
     "sample_manual_check_window",
     "launch_manual_check",
     "summarize_manual_check",
+    "launch_segment_editor",
+    "plot_segments_window",
+    "segment_move",
+    "segment_split",
+    "segment_merge",
+    "segment_delete",
+    "segment_add",
+    "sync_segments_to_disk",
     "validate_segments_integrity",
     "generate_qc_markdown_report",
     "video_summary",
