@@ -171,10 +171,12 @@ class KaggleCliBackend(CorpusBackend):
         # Configure notebook Cell 6 for pure Kaggle CLI worker mode with CURRENT_JOB embedded
         c6 = "".join(nb["cells"][6]["source"])
         c6 = c6.replace("START_REMOTE_SERVER = True", "START_REMOTE_SERVER = False")
-        job_lit = json.dumps(job, ensure_ascii=False)
+        # Use json.loads(repr-string) so Python booleans (True/False/None) are correct —
+        # json.dumps produces JSON `false`/`true`/`null` which are invalid Python identifiers.
+        job_json_str = json.dumps(job, ensure_ascii=False)
         cli_snippet = (
             f"\nKAGGLE_CLI_MODE = True\n"
-            f"CURRENT_JOB = {job_lit}\n"
+            f"CURRENT_JOB = __import__('json').loads({job_json_str!r})\n"
         )
         c6 = c6 + cli_snippet
         lines = c6.splitlines(keepends=True)

@@ -1,6 +1,7 @@
 """Tests for pure Kaggle CLI backend, persistent worker loop, dataset naming, and GUI integration."""
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
@@ -244,6 +245,18 @@ class KaggleCliModeTests(unittest.TestCase):
                 vi1 = backend.download("https://www.youtube.com/watch?v=Xr2iW-qZ_II", lambda _f, _m="": None)
                 self.assertEqual(vi1.id, "Xr2iW-qZ_II")
                 self.assertEqual(push_count["n"], 1)
+                # Verify pushed notebook Cell 6 is valid Python (no JSON `false`/`true`/`null` leakage)
+                _, pushed_nb = store.kernel_pushes[0]
+                for idx, cell in enumerate(pushed_nb["cells"]):
+                    if cell.get("cell_type") == "code":
+                        src = "".join(cell["source"])
+                        ast.parse(src, filename=f"cell_{idx}.py")
+                c6_src = "".join(pushed_nb["cells"][6]["source"])
+                c6_tail = "\n".join(c6_src.splitlines()[-2:])
+                ns: dict = {}
+                exec(compile(c6_tail, "cell_6_tail.py", "exec"), ns)
+                self.assertTrue(ns["KAGGLE_CLI_MODE"])
+                self.assertIs(ns["CURRENT_JOB"]["word_verification"], False)
                 self.assertTrue((pc_data / "Xr2iW-qZ_II" / "audio.wav").exists())
                 self.assertTrue((pc_data / "Xr2iW-qZ_II" / "segments" / "segment_0001.wav").exists())
                 self.assertTrue((dl_dir / "corpus_final_output_my-test-corpus_Xr2iW-qZ_II.zip").exists())

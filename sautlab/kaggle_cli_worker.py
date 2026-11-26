@@ -323,6 +323,8 @@ def run_worker_session(
         if qfile is not None and qfile.is_file():
             try:
                 cur_job = json.loads(qfile.read_text(encoding="utf-8"))
+                if cur_job and cur_job.get("action") == "process" and not cur_job.get("url"):
+                    download_file_from_kaggle_dataset(f"{username}/{queue_slug}", "audio_conditioned.flac", tmp_dl)
             except Exception:
                 cur_job = None
 
