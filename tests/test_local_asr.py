@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from sautlab.backend.corpus import CorpusBackend
 from sautlab.local_asr import (
+    _wait_llama_server_ready,
     clean_audar_text,
     free_cuda_memory,
     run_local_dual_asr,
@@ -202,6 +203,76 @@ class LocalDualAsrTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_audar_subprocess_log_file_prevents_stderr_pipe_deadlock(self) -> None:
+        import subprocess
+
+        # 1. Early exit error tail is captured from the temp log file on Windows.
+        with tempfile.NamedTemporaryFile(mode="w+b", prefix="sautlab_test_", suffix=".log", delete=False) as log_fh:
+            log_path = Path(log_fh.name)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stderr.write('simulated crash reason'); sys.exit(2)"],
+                stdout=subprocess.DEVNULL,
+                stderr=log_fh,
+            )
+            try:
+                proc.wait(timeout=10)
+                with self.assertRaises(RuntimeError) as ctx:
+                    _wait_llama_server_ready(proc, "http://127.0.0.1:1", timeout_s=5.0, log_path=log_path)
+                self.assertIn("simulated crash reason", str(ctx.exception))
+            finally:
+                log_fh.close()
+                log_path.unlink(missing_ok=True)
+
+        # 2. >150 KB of stderr across 85 requests must never deadlock and leaves no leftover temp logs.
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            fake_exe = tp / "llama-server.exe"
+            fake_exe.write_bytes(b"")
+            fake_model = tp / "m.gguf"
+            fake_mmproj = tp / "mm.gguf"
+            wav = tp / "clip.wav"
+            write_wav(wav, np.full(8000, 0.05, dtype=np.float32), sample_rate=DEFAULT_SR)
+
+            child_script = (
+                "import sys, json\n"
+                "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+                "args = sys.argv[1:]\n"
+                "port = int(args[args.index('--port') + 1])\n"
+                "assert args[args.index('-np') + 1] == '1'\n"
+                "class H(BaseHTTPRequestHandler):\n"
+                "  def do_GET(self):\n"
+                "    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
+                "  def do_POST(self):\n"
+                "    n = int(self.headers.get('Content-Length', '0')); self.rfile.read(n)\n"
+                "    sys.stderr.write('LOG ' + ('x' * 2048) + '\\n'); sys.stderr.flush()\n"
+                "    self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()\n"
+                "    self.wfile.write(json.dumps({'text': 'مرحبا'}).encode('utf-8'))\n"
+                "  def log_message(self, *a): pass\n"
+                "HTTPServer(('127.0.0.1', port), H).serve_forever()\n"
+            )
+
+            real_popen = subprocess.Popen
+            captured_cmds: list[list[str]] = []
+
+            def _spawn_py_server(cmd, **kw):
+                captured_cmds.append(list(cmd))
+                self.assertNotEqual(kw.get("stderr"), subprocess.PIPE)
+                return real_popen([sys.executable, "-c", child_script, *cmd[1:]], **kw)
+
+            before_logs = set(Path(tempfile.gettempdir()).glob("sautlab_llama_*.log"))
+            with (
+                patch("sautlab.local_asr.ensure_llama_cpp_server", return_value=fake_exe),
+                patch("sautlab.local_asr.ensure_audar_gguf", return_value=(fake_model, fake_mmproj)),
+                patch("sautlab.local_asr.subprocess.Popen", side_effect=_spawn_py_server),
+            ):
+                out = transcribe_audar_quantized([wav] * 85)
+            after_logs = set(Path(tempfile.gettempdir()).glob("sautlab_llama_*.log"))
+
+            self.assertEqual(len(out), 85)
+            self.assertTrue(all(x == "مرحبا" for x in out))
+            self.assertIn("-np", captured_cmds[0])
+            self.assertEqual(before_logs, after_logs)
 
 
 if __name__ == "__main__":

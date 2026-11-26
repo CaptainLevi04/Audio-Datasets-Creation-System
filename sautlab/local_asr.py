@@ -277,14 +277,34 @@ def _free_local_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _wait_llama_server_ready(proc: subprocess.Popen, base_url: str, timeout_s: float = 120.0) -> None:
+def _read_log_tail(log_path: Path | None, proc: subprocess.Popen | None = None, limit: int = 1200) -> str:
+    if log_path is not None:
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            return text[-limit:]
+        except OSError:
+            pass
+    if proc is not None and proc.stderr is not None:
+        try:
+            return proc.stderr.read().decode("utf-8", errors="replace")[-limit:]
+        except Exception:
+            pass
+    return ""
+
+
+def _wait_llama_server_ready(
+    proc: subprocess.Popen,
+    base_url: str,
+    timeout_s: float = 120.0,
+    log_path: Path | None = None,
+) -> None:
     import httpx
 
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         if proc.poll() is not None:
-            out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
-            raise RuntimeError(f"llama-server exited early (code {proc.returncode}):\n{out[-1200:]}")
+            out = _read_log_tail(log_path, proc)
+            raise RuntimeError(f"llama-server exited early (code {proc.returncode}):\n{out}")
         try:
             r = httpx.get(f"{base_url}/health", timeout=2.0)
             if r.status_code == 200:
@@ -344,6 +364,8 @@ def transcribe_audar_quantized(
     import httpx
 
     proc: subprocess.Popen | None = None
+    log_fh = None
+    log_path: Path | None = None
     try:
         if server_url:
             base_url = server_url.rstrip("/")
@@ -367,21 +389,26 @@ def transcribe_audar_quantized(
                 str(gpu_layers),
                 "-c",
                 str(ctx_size),
+                "-np",
+                "1",
                 "--temp",
                 "0",
             ]
+            # Write stderr to a temp file rather than a PIPE so Windows pipe buffers never fill and deadlock long runs.
+            log_fh = tempfile.NamedTemporaryFile(mode="w+b", prefix="sautlab_llama_", suffix=".log", delete=False)
+            log_path = Path(log_fh.name)
             progress(0.10, "Starting quantized Audar GPU server...")
             proc = subprocess.Popen(
                 cmd,
                 env=_subprocess_cuda_env(srv_exe.parent),
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=log_fh,
             )
-            _wait_llama_server_ready(proc, base_url, timeout_s=120.0)
+            _wait_llama_server_ready(proc, base_url, timeout_s=120.0, log_path=log_path)
 
         out: list[str] = []
         total = len(wav_paths)
-        with httpx.Client() as client:
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
             for idx, wp in enumerate(wav_paths):
                 rms = rms_values[idx] if rms_values is not None else 1.0
                 if rms < 1e-3:
@@ -397,6 +424,17 @@ def transcribe_audar_quantized(
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except OSError:
+                pass
+        if log_path is not None:
+            log_path.unlink(missing_ok=True)
         free_cuda_memory()
 
 
