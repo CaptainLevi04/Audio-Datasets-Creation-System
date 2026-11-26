@@ -57,19 +57,10 @@ class Worker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(
-        self,
-        backend: Backend,
-        user: str = "Mohamed Ahmed",
-        backend_factory=None,
-        watch_downloads: list[str | Path] | None = None,
-    ):
+    def __init__(self, backend: Backend, user: str = "Mohamed Ahmed", backend_factory=None):
         super().__init__()
         self.backend = backend
         self.backend_factory = backend_factory  # callable(data_dir) -> Backend, enables "Open data folder"
-        self._watch_dirs = [Path(p) for p in watch_downloads] if watch_downloads else []
-        self._auto_importing = False
-        self._download_timer: QTimer | None = None
         self.c = ProjectController(backend, user)
         self.player = Player()
         self._workers: set[Worker] = set()
@@ -87,8 +78,6 @@ class MainWindow(QMainWindow):
 
         # panels
         self.source = VideoSourceCard()
-        if hasattr(backend, "set_dataset_name"):
-            self.source.set_dataset_controls(True, getattr(backend, "dataset_name", "sautlab-corpus"))
         self.info = VideoInfoCard()
         self.extract = AudioExtractionCard()
         self.videos = ProjectVideosCard()
@@ -139,10 +128,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._wire()
         QApplication.instance().aboutToQuit.connect(self._stop_workers)
-        self._startup_timer = QTimer(self)
-        self._startup_timer.setSingleShot(True)
-        self._startup_timer.timeout.connect(self._startup)
-        self._startup_timer.start(0)
+        QTimer.singleShot(0, self._startup)
 
     # top bar
     def _build_topbar(self) -> QWidget:
@@ -239,8 +225,6 @@ class MainWindow(QMainWindow):
         a_quit = self._act("Quit", self.close, "Ctrl+Q")
         if self.backend_factory is not None:
             m["Project"].menu().addAction(self._act("Open data folder...", self._open_data_folder, "Ctrl+O", "folder-open-outline"))
-        if hasattr(self.backend, "import_kaggle_zip"):
-            m["Project"].menu().addAction(self._act("Import Kaggle output zip...", self._import_kaggle_zip, None, "folder-open-outline"))
         m["Project"].menu().addActions([self.a_save])
         m["Project"].menu().addSeparator()
         m["Project"].menu().addAction(a_quit)
@@ -252,10 +236,6 @@ class MainWindow(QMainWindow):
 
         self.a_run = self._act("Run pipeline on this video", self._run_pipeline, "Ctrl+R", "play")
         m["Processing"].menu().addAction(self.a_run)
-        if hasattr(self.backend, "pull_remote_videos"):
-            m["Processing"].menu().addAction(self._act("Pull finished videos from Kaggle...", self._pull_from_kaggle, None, "download"))
-        if hasattr(self.backend, "shutdown_session"):
-            m["Processing"].menu().addAction(self._act("Stop Kaggle GPU Session", self._stop_kaggle_session))
         self.a_rerun = self._act("Recompute SNR for selected segment", self._reprocess_selected, None, "refresh")
         a_asr = self._act("Import ASR results (Kaggle segments.csv)...", self._import_asr, None, "file-export-outline")
         m["Processing"].menu().addActions([self.a_rerun, a_asr])
@@ -305,16 +285,6 @@ class MainWindow(QMainWindow):
                 cm.addAction(a)
         if hasattr(self.backend, "cookies_file"):
             sm.addAction(self._act("YouTube cookies.txt...", self._set_cookies))
-        if hasattr(self.backend, "remote_url"):
-            sm.addAction(self._act("Kaggle Remote Server URL...", self._set_kaggle_url))
-            sm.addAction(self._act("Connect to Kaggle Auto-Beacon", self._connect_auto_beacon))
-            a_fb = self._act(
-                "Allow local CPU fallback if Kaggle offline",
-                lambda on: setattr(self.backend, "allow_local_fallback", bool(on)),
-                checkable=True,
-            )
-            a_fb.setChecked(bool(getattr(self.backend, "allow_local_fallback", True)))
-            sm.addAction(a_fb)
         ctx = sm.addMenu("Listen-around-cut context")
         grp = QActionGroup(self)
         for sec in (1.0, 1.5, 2.0, 3.0):
@@ -374,19 +344,6 @@ class MainWindow(QMainWindow):
         self._refresh_videos()
         if self.c.videos:
             self._select_video(self.c.videos[0].id)
-        if getattr(self.backend, "is_remote", False):
-            self.c.log_info(f"Connected to Kaggle GPU server: {self.backend.remote_url}", kind="ok")
-        elif getattr(self.backend, "auto_beacon", False):
-            self.c.log_info("Kaggle Auto-Beacon active (will bind automatically once Kaggle Run All starts).", kind="info")
-        if self._watch_dirs and hasattr(self.backend, "import_kaggle_zip"):
-            self._download_timer = QTimer(self)
-            self._download_timer.setInterval(3000)
-            self._download_timer.timeout.connect(self._poll_downloads)
-            self._download_timer.start()
-            self.c.log_info(
-                f"Auto-watch active on: {', '.join(str(p) for p in self._watch_dirs)}",
-                kind="info",
-            )
 
     def _select_video(self, vid: str) -> None:
         if self.c.video and self.c.video.id == vid:
@@ -431,41 +388,19 @@ class MainWindow(QMainWindow):
 
     # download and extraction
     def _download(self, url: str) -> None:
-        if hasattr(self.backend, "set_dataset_name"):
-            slug = self.backend.set_dataset_name(self.source.dataset.text())
-            self.source.dataset.setText(slug)
-            self.c.log_info(f"Submitting Kaggle CLI run -> dataset: {slug}", kind="info")
-        self._last_dl_stage = ""
         self.source.set_busy(True, 0.0, "Starting download...")
         w = Worker(lambda prog: self.backend.download(url, prog))
-        w.progress.connect(self._download_progress)
+        w.progress.connect(lambda f, m: self.source.set_busy(True, f, m))
         w.done.connect(self._downloaded)
         w.failed.connect(lambda msg: self._error("Download failed", msg))
         self._run_worker(w)
-
-    def _download_progress(self, f: float, m: str) -> None:
-        self.source.set_busy(True, f, m)
-        stage = m.split("(")[0].strip() if m else ""
-        if stage and stage != getattr(self, "_last_dl_stage", ""):
-            self._last_dl_stage = stage
-            self.c.log_info(m, kind="info")
 
     def _downloaded(self, v) -> None:
         self.source.set_busy(False, text="Download complete")
         self.source.url.clear()
         self.c.refresh_videos()
-        self._refresh_videos()
-        self.c.log_info(f"Ready: {v.title}", kind="ok")
+        self.c.log_info(f"Downloaded: {v.title}")
         self._extract(v.id, 16000, 1, then_select=True)
-
-    def _stop_kaggle_session(self) -> None:
-        if not hasattr(self.backend, "shutdown_session"):
-            return
-        self.c.log_info("Sending shutdown signal to Kaggle session...", kind="info")
-        w = Worker(lambda _prog: self.backend.shutdown_session())
-        w.done.connect(lambda _r: self.c.log_info("Kaggle shutdown signal sent.", kind="ok"))
-        w.failed.connect(self._worker_failed("Could not stop Kaggle session"))
-        self._run_worker(w)
 
     def _add_local_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -537,144 +472,6 @@ class MainWindow(QMainWindow):
         if path:
             self.backend.cookies_file = path
             self.c.log_info("YouTube cookies file set.")
-
-    def _set_kaggle_url(self) -> None:
-        if not hasattr(self.backend, "remote_url"):
-            return
-        cur = getattr(self.backend, "remote_url", None) or ""
-        url, ok = QInputDialog.getText(
-            self,
-            "Kaggle Remote Server URL",
-            "Public URL printed by main-runner.ipynb (leave blank for local execution):",
-            text=cur,
-        )
-        if not ok:
-            return
-        cleaned = url.strip().rstrip("/") or None
-        self.backend.remote_url = cleaned
-        if not cleaned:
-            self.c.log_info("Switched to local backend execution.", kind="info")
-            return
-        self.c.log_info(f"Checking Kaggle server at {cleaned} ...", kind="info")
-        w = Worker(lambda _prog: self.backend.check_health())
-        w.done.connect(
-            lambda info: self.c.log_info(
-                f"Connected to Kaggle GPU server: {info.get('device', 'unknown')} | "
-                f"cookies={'yes' if info.get('has_cookies') else 'no'} | videos={info.get('videos_count', 0)}",
-                kind="ok",
-            )
-        )
-        w.failed.connect(self._worker_failed("Could not reach Kaggle Remote Server"))
-        self._run_worker(w)
-
-    def _connect_auto_beacon(self) -> None:
-        if not hasattr(self.backend, "connect_auto_beacon"):
-            return
-        self.c.log_info("Checking private Kaggle Auto-Beacon...", kind="info")
-
-        def _do(_prog):
-            health = self.backend.connect_auto_beacon()
-            if not health:
-                raise RuntimeError(
-                    "No live Kaggle Auto-Beacon found. Make sure Phase 4 (`START_REMOTE_SERVER = True`) is running "
-                    "on Kaggle and `KAGGLE_API_TOKEN` is set in Kaggle Add-ons -> Secrets."
-                )
-            return health
-
-        w = Worker(_do)
-        w.done.connect(
-            lambda info: self.c.log_info(
-                f"Auto-connected to Kaggle GPU ({self.backend.remote_url}): {info.get('device', 'unknown')} | "
-                f"cookies={'yes' if info.get('has_cookies') else 'no'}",
-                kind="ok",
-            )
-        )
-        w.failed.connect(self._worker_failed("Kaggle Auto-Beacon unavailable"))
-        self._run_worker(w)
-
-    def _import_kaggle_zip(self) -> None:
-        if not hasattr(self.backend, "import_kaggle_zip"):
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Kaggle corpus archive (corpus_final_output.zip)", "", "ZIP archives (*.zip)"
-        )
-        if not path:
-            return
-        self._start_zip_import(path, auto=False)
-
-    def _poll_downloads(self) -> None:
-        if self._auto_importing or self._pipeline_busy or not hasattr(self.backend, "import_kaggle_zip"):
-            return
-        data_root = getattr(self.backend, "root", None)
-        if data_root is None:
-            return
-        from .kaggle_bridge import find_latest_kaggle_zip, should_auto_import
-
-        cand = find_latest_kaggle_zip(search_dirs=self._watch_dirs)
-        if cand is not None and should_auto_import(cand, data_root):
-            self._start_zip_import(cand, auto=True)
-
-    def _start_zip_import(self, path: str | Path, auto: bool = False) -> None:
-        if self._auto_importing:
-            return
-        zp = Path(path)
-        if self.c.dirty:
-            self.c.save()
-        self._auto_importing = True
-        prefix = "Auto-detected Kaggle archive in Downloads" if auto else "Importing & hydrating"
-        self.c.log_info(f"{prefix}: {zp.name} ...", kind="info")
-
-        def _do(_prog):
-            vids = self.backend.import_kaggle_zip(zp)
-            data_root = getattr(self.backend, "root", None)
-            if data_root is not None:
-                from .kaggle_bridge import record_auto_import
-
-                record_auto_import(zp, data_root, vids)
-            return vids
-
-        w = Worker(_do)
-        w.done.connect(lambda vids: self._zip_import_finished(vids, zp.name, auto))
-        w.failed.connect(lambda msg: self._zip_import_failed(msg, auto))
-        self._run_worker(w)
-
-    def _zip_import_finished(self, vids: list[str], name: str, auto: bool) -> None:
-        self._auto_importing = False
-        src = f"Downloads ({name})" if auto else f"Kaggle archive ({name})"
-        self._kaggle_imported(vids, source=src)
-
-    def _zip_import_failed(self, msg: str, auto: bool) -> None:
-        self._auto_importing = False
-        if auto:
-            self.c.log_info(f"Auto-import waiting ({msg})", kind="warn")
-        else:
-            self._error("Could not import Kaggle archive", msg)
-
-    def _pull_from_kaggle(self) -> None:
-        if not hasattr(self.backend, "pull_remote_videos"):
-            return
-        if not getattr(self.backend, "is_remote", False):
-            self._set_kaggle_url()
-            if not getattr(self.backend, "is_remote", False):
-                return
-        if self.c.dirty:
-            self.c.save()
-        self.c.log_info("Pulling compact FLAC + CSV bundles from Kaggle...", kind="info")
-        w = Worker(lambda prog: self.backend.pull_remote_videos(progress=prog))
-        w.progress.connect(lambda _f, m: self.c.log_info(m, kind="info") if m else None)
-        w.done.connect(lambda vids: self._kaggle_imported(vids, source="Kaggle server"))
-        w.failed.connect(self._worker_failed("Could not pull videos from Kaggle"))
-        self._run_worker(w)
-
-    def _kaggle_imported(self, vids: list[str], source: str) -> None:
-        self.c.refresh_videos()
-        self._refresh_videos()
-        if vids:
-            self.c.video = None
-            self._select_video(vids[0])
-            self.c.log_info(f"Loaded {len(vids)} video(s) from {source}: {', '.join(vids)}", kind="ok")
-        else:
-            self.c.log_info(f"No video folders found in {source}.", kind="warn")
 
     def _extract_clicked(self, sr: int, ch: int) -> None:
         if self.c.video:
@@ -881,12 +678,6 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 ev.ignore()
                 return
-        if getattr(self, "_startup_timer", None) is not None:
-            self._startup_timer.stop()
-        if self._download_timer is not None:
-            self._download_timer.stop()
-        if hasattr(self.backend, "shutdown_session"):
-            self.backend.shutdown_session()
         if self.c.dirty:
             self.c.save()
         self.player.pause()

@@ -10,14 +10,15 @@ Works on the same folder layout as runner.ipynb (one folder per video):
         segments_snr.csv           + snr / quality
         snr_diagnostics.csv        energy / WADA SNR per segment
         segments.csv               the 16 review columns (what the GUI edits)
-        segments_asr.csv           untouched copy of the Kaggle ASR output
+        segments_asr.csv           untouched copy of the automatic ASR output
         segments_full.csv          review columns + extra columns
         transcripts/segment_0001.txt
         changes.csv                audit trail (who / what / when)
         gui_state.json             GUI-only data (confidence, notes, ...)
 
-Phases 1, 2 (SNR) run here. Dual ASR (Whisper large-v3 + Audar) needs a GPU, so it
-stays in the Kaggle runner; its segments.csv is loaded with `import_asr`.
+Runs Steps 1-6 locally, including low-VRAM sequential Dual ASR
+(NVIDIA Arabic Conformer + quantized Audar-ASR-V1-Turbo), and also supports importing
+external `segments.csv` files via `import_asr`.
 """
 from __future__ import annotations
 
@@ -32,6 +33,14 @@ from pathlib import Path
 
 import numpy as np
 
+from ..local_asr import (
+    DEFAULT_AUDAR_GGUF,
+    DEFAULT_CONFORMER_DECODER,
+    DEFAULT_CONFORMER_MODEL,
+    free_cuda_memory,
+    run_local_dual_asr,
+    transcribe_clip_dual_asr,
+)
 from ..models import PIPELINE_STEPS, Segment, VideoInfo
 from ..review_csv import audio_name, read_review_csv, read_rows, write_review_csv
 from .base import Backend, Progress
@@ -72,7 +81,7 @@ def _safe_id(text: str) -> str:
 
 
 class CorpusBackend(Backend):
-    asr_names = ("Whisper", "Audar")
+    asr_names = ("Conformer", "Audar")
 
     def __init__(
         self,
@@ -84,6 +93,10 @@ class CorpusBackend(Backend):
         word_verification: bool = False,
         cookies_file: str | None = None,
         device: str | None = None,
+        run_asr: bool | None = None,
+        conformer_model: str = DEFAULT_CONFORMER_MODEL,
+        conformer_decoder: str = DEFAULT_CONFORMER_DECODER,
+        audar_quant: str = DEFAULT_AUDAR_GGUF,
     ):
         try:
             import speech_corpus  # noqa: F401
@@ -101,6 +114,10 @@ class CorpusBackend(Backend):
         self.word_verification = word_verification
         self.cookies_file = cookies_file
         self.device = device
+        self.run_asr = (classifier != "heuristic") if run_asr is None else bool(run_asr)
+        self.conformer_model = conformer_model
+        self.conformer_decoder = conformer_decoder
+        self.audar_quant = audar_quant
         self.run_ablation = False
 
         self._lock = threading.RLock()
@@ -122,27 +139,25 @@ class CorpusBackend(Backend):
         out = []
         for p in sorted(self.root.iterdir()):
             # YouTube ids may start with "_" or "-", so only hidden folders are skipped
-            if p.is_dir() and not p.name.startswith(".") and (
-                (p / "audio.wav").exists() or (p / "audio_conditioned.flac").exists() or (p / "info.json").exists()
-            ):
+            if p.is_dir() and not p.name.startswith(".") and ((p / "audio.wav").exists() or (p / "info.json").exists()):
                 out.append(p)
         return out
 
     def _duration(self, vdir: Path, info: dict) -> float:
-        for cand in (vdir / "audio.wav", vdir / "audio_conditioned.flac"):
-            if cand.exists():
-                mt = cand.stat().st_mtime
-                cached = self._dur_cache.get(str(cand))
-                if cached and cached[0] == mt:
-                    return cached[1]
-                try:
-                    import soundfile as sf
+        wav = vdir / "audio.wav"
+        if wav.exists():
+            mt = wav.stat().st_mtime
+            cached = self._dur_cache.get(str(wav))
+            if cached and cached[0] == mt:
+                return cached[1]
+            try:
+                import soundfile as sf
 
-                    d = float(sf.info(str(cand)).duration)
-                    self._dur_cache[str(cand)] = (mt, d)
-                    return d
-                except Exception:
-                    pass
+                d = float(sf.info(str(wav)).duration)
+                self._dur_cache[str(wav)] = (mt, d)
+                return d
+            except Exception:
+                pass
         return float(info.get("duration_s") or 0.0)
 
     def _csv_flags(self, path: Path) -> dict:
@@ -183,18 +198,16 @@ class CorpusBackend(Backend):
         def done(key: str, path: Path) -> None:
             steps[key] = {"state": "done", "info": _stamp(path)}
 
-        for p in (vdir / "info.json", vdir / "audio.wav", vdir / "audio_conditioned.flac"):
+        for p in (vdir / "info.json", vdir / "audio.wav"):
             if p.exists():
                 done("download", p)
                 break
         if (vdir / "audio.wav").exists():
             done("extract", vdir / "audio.wav")
-        elif (vdir / "audio_conditioned.flac").exists():
-            done("extract", vdir / "audio_conditioned.flac")
         if (vdir / "regions.csv").exists():
             done("region_labels", vdir / "regions.csv")
         seg_csv = next((vdir / n for n in ("segments_student1.csv", "segments.csv") if (vdir / n).exists()), None)
-        if seg_csv is not None and ((vdir / "segments").is_dir() or (vdir / "audio_conditioned.flac").exists()):
+        if seg_csv is not None and (vdir / "segments").is_dir():
             done("segmentation", seg_csv)
         main = vdir / "segments.csv"
         flags = self._csv_flags(main)
@@ -221,12 +234,7 @@ class CorpusBackend(Backend):
             v.license = info.get("license") or "-"
             v.url = info.get("webpage_url") or info.get("url") or ""
             v.duration = self._duration(vdir, info)
-            if (vdir / "audio.wav").exists():
-                v.audio_path = str(vdir / "audio.wav")
-            elif (vdir / "audio_conditioned.flac").exists():
-                v.audio_path = str(vdir / "audio_conditioned.flac")
-            else:
-                v.audio_path = None
+            v.audio_path = str(vdir / "audio.wav") if (vdir / "audio.wav").exists() else None
             v.steps = self._steps(vid, vdir)
             fl = self._csv_flags(vdir / "segments.csv")
             v.progress = (fl["accepted"] / fl["text"]) if fl["text"] else 0.0
@@ -299,22 +307,7 @@ class CorpusBackend(Backend):
         return str(wav)
 
     def audio_path(self, video_id: str) -> str:
-        vdir = self._dir(video_id)
-        wav = vdir / "audio.wav"
-        if not wav.exists() and (vdir / "audio_conditioned.flac").exists():
-            from ..kaggle_bridge import hydrate_video_dir
-
-            hydrate_video_dir(vdir, slice_segments=False)
-        return str(wav)
-
-    def import_kaggle_zip(self, zip_path: str | Path) -> list[str]:
-        """Extract a compact or full Kaggle output archive into `self.root` and hydrate audio."""
-        from ..kaggle_bridge import unpack_corpus_archive
-
-        vids = unpack_corpus_archive(zip_path, self.root, hydrate=True)
-        self._flags_cache.clear()
-        self.list_videos()
-        return vids
+        return str(self._dir(video_id) / "audio.wav")
 
     def load_audio(self, video_id: str) -> tuple[np.ndarray, int]:
         import speech_corpus as sc
@@ -353,10 +346,6 @@ class CorpusBackend(Backend):
 
     def load_segments(self, video_id: str) -> list[Segment]:
         vdir = self._dir(video_id)
-        if not (vdir / "segments").is_dir() and ((vdir / "audio.wav").exists() or (vdir / "audio_conditioned.flac").exists()):
-            from ..kaggle_bridge import hydrate_video_dir
-
-            hydrate_video_dir(vdir, slice_segments=True)
         path = next((vdir / n for n in ("segments.csv", "segments_snr.csv", "segments_student1.csv") if (vdir / n).exists()), None)
         if path is None:
             return []
@@ -476,7 +465,7 @@ class CorpusBackend(Backend):
             ),
             "notes": lambda s: s.notes,
             "decided_by": lambda s: s.decided_by,
-            "second_model": lambda s: "audar",
+            "second_model": lambda s: "audar_q4",
         }
         write_review_csv(vdir / "segments_full.csv", segs, extras)
 
@@ -501,7 +490,10 @@ class CorpusBackend(Backend):
                 p.write_text(s.final_text, encoding="utf-8")
             else:
                 st = "difficult" if s.status == "difficult" else "human_choice"
-                p.write_text(f"[{st}]\nModel A (Whisper): {s.asr_a}\nModel B (Audar): {s.asr_b}\n", encoding="utf-8")
+                p.write_text(
+                    f"[{st}]\nModel A ({self.asr_names[0]}): {s.asr_a}\nModel B ({self.asr_names[1]}): {s.asr_b}\n",
+                    encoding="utf-8",
+                )
 
     def save_segments(self, video_id: str, segments: list[Segment], log: list[dict]) -> None:
         vdir = self._dir(video_id)
@@ -564,7 +556,7 @@ class CorpusBackend(Backend):
         vdir = self._dir(video_id)
         audio, sr = self.load_audio(video_id)
         dur = len(audio) / sr
-        steps = ("region_labels", "segmentation", "snr")
+        steps = ("region_labels", "segmentation", "snr", "dual_asr")
         try:
             # step 3: regions
             self._set_running(video_id, "region_labels", True)
@@ -580,7 +572,7 @@ class CorpusBackend(Backend):
                 note = ""
                 if kind == "heuristic" and self.classifier != "heuristic":
                     note = " - torch/transformers not found, using the less accurate heuristic"
-                progress(0.15, f"Classifying regions ({kind}){note}...")
+                progress(0.10, f"Classifying regions ({kind}){note}...")
                 if kind == "ast":
                     regions_df, windows_df = sc.classify_audio(
                         y=audio, sr=sr, win_s=10.0, hop_s=5.0, batch_size=32, device=self.device, pauses_df=pauses_df
@@ -592,11 +584,12 @@ class CorpusBackend(Backend):
                 sc.save_regions(regions_df, regions_csv, source_id=vdir.name, duration=dur, version="2.2")
                 if isinstance(windows_df, pd.DataFrame) and not windows_df.empty:
                     windows_df.to_csv(vdir / "windows_ast.csv", index=False)
+            free_cuda_memory()
             self._set_running(video_id, "region_labels", False)
 
             # step 4: segmentation
             self._set_running(video_id, "segmentation", True)
-            progress(0.4, "Cutting segments at pauses...")
+            progress(0.25, "Cutting segments at pauses...")
             segments_df = sc.cut_speech_and_mixed_segments(
                 audio=audio, regions_df=regions_df, out_dir=vdir, sr=sr, pauses=pauses_df,
                 use_word_verification=self.word_verification, run_ablation=self.run_ablation,
@@ -616,12 +609,12 @@ class CorpusBackend(Backend):
                 qc = sc.validate_segments_integrity(segments_df, video_dir=vdir, total_dur=dur, sr=sr)
                 sc.generate_qc_markdown_report(segments_df, report_path=vdir / "qc_report.md", video_dir=vdir, qc=qc)
             except Exception as e:  # the report is a bonus, never stop the pipeline for it
-                progress(0.6, f"QC report skipped: {e}")
+                progress(0.35, f"QC report skipped: {e}")
             self._set_running(video_id, "segmentation", False)
 
             # step 5: SNR
             self._set_running(video_id, "snr", True)
-            progress(0.7, "Estimating SNR...")
+            progress(0.42, "Estimating SNR...")
             src = pd.read_csv(vdir / "segments_student1.csv", dtype={"segment_id": str})
             snr_df, _ = compute_snr_for_segments(
                 src, base_dir=vdir, threshold_db=self.snr_threshold, combine=self.snr_combine, save_csv=True, verbose=False
@@ -641,14 +634,32 @@ class CorpusBackend(Backend):
                 )
             pd.DataFrame(diag).to_csv(vdir / "snr_diagnostics.csv", index=False, encoding="utf-8-sig")
             self._set_running(video_id, "snr", False)
+
+            # Fresh cut replaces previous transcripts and checkpoints.
+            shutil.rmtree(vdir / "transcripts", ignore_errors=True)
+            (vdir / "gui_state.json").unlink(missing_ok=True)
+            (vdir / "segments_asr.csv").unlink(missing_ok=True)
+            (vdir / "asr_conformer_ckpt.csv").unlink(missing_ok=True)
+            (vdir / "asr_audar_ckpt.csv").unlink(missing_ok=True)
+            (vdir / "segments.csv").unlink(missing_ok=True)
+
+            # step 6: Local Dual ASR (Conformer + Quantized Audar) sequentially in <= 4 GB VRAM
+            if self.run_asr:
+                self._set_running(video_id, "dual_asr", True)
+                run_local_dual_asr(
+                    vdir,
+                    conformer_model=self.conformer_model,
+                    conformer_decoder=self.conformer_decoder,
+                    audar_quant=self.audar_quant,
+                    device=self.device,
+                    force=True,
+                    progress=lambda f, m="": progress(0.50 + 0.48 * f, m),
+                )
+                self._set_running(video_id, "dual_asr", False)
         finally:
             for st in steps:
                 self._set_running(video_id, st, False)
 
-        # a new cut means the old GUI state and transcripts no longer apply
-        shutil.rmtree(vdir / "transcripts", ignore_errors=True)
-        (vdir / "gui_state.json").unlink(missing_ok=True)
-        (vdir / "segments_asr.csv").unlink(missing_ok=True)
         self._flags_cache.clear()
         progress(1.0, "Pipeline finished")
         segs = self.load_segments(video_id)
@@ -657,17 +668,33 @@ class CorpusBackend(Backend):
         return segs
 
     def reprocess_segment(self, video_id: str, segment: Segment) -> Segment:
-        """Re-estimate SNR for the current cut. ASR needs the GPU runner, so transcripts are kept."""
+        """Re-estimate SNR (and Dual ASR when enabled) for the current cut."""
         from speech_corpus.snr import estimate_segment_snr
 
         audio, sr = self.load_audio(video_id)
         a, b = int(round(segment.start * sr)), int(round(segment.end * sr))
-        est = estimate_segment_snr(audio[a:b], sr, self.snr_threshold, self.snr_combine)
+        clip = audio[a:b]
+        est = estimate_segment_snr(clip, sr, self.snr_threshold, self.snr_combine)
         segment.snr = est["snr"]
         segment.snr_energy = est["snr_energy_db"]
         segment.snr_wada = est["snr_wada_db"]
         segment.quality = segment.quality_auto = est["quality"]
-        if segment.has_text and (segment.asr_a or segment.asr_b):
+        if segment.has_text and self.run_asr:
+            a_txt, b_txt, scored = transcribe_clip_dual_asr(
+                clip,
+                sr=sr,
+                conformer_model=self.conformer_model,
+                conformer_decoder=self.conformer_decoder,
+                audar_quant=self.audar_quant,
+                device=self.device,
+            )
+            segment.asr_a = a_txt
+            segment.asr_b = b_txt
+            segment.auto_status = scored["csv_status"]
+            segment.status = scored["gui_status"]
+            segment.final_text = a_txt if segment.status == "accepted" else ""
+            segment.decided_by = "auto" if segment.status == "accepted" else "human"
+        elif segment.has_text and (segment.asr_a or segment.asr_b):
             segment.status = "needs_review"
         return segment
 

@@ -97,7 +97,7 @@ def main() -> int:
 
     app = QApplication([])
     app.setStyleSheet(STYLESHEET)
-    backend = CorpusBackend(data, classifier="heuristic", vad="energy")
+    backend = CorpusBackend(data, classifier="heuristic", vad="energy", run_asr=False)
     win = MainWindow(backend, "Tester")
     win.resize(1600, 1000)
     win.show()
@@ -203,7 +203,7 @@ def main() -> int:
     check(vocab <= {"accepted", "human_choice", "difficult", "no_asr", "not_run"}, f"status vocabulary {sorted(vocab)}")
 
     # reload from disk in a fresh backend
-    b2 = CorpusBackend(data, classifier="heuristic", vad="energy")
+    b2 = CorpusBackend(data, classifier="heuristic", vad="energy", run_asr=False)
     again = b2.load_segments(vid)
     check(len(again) == len(c.segments), "saved work reloads")
     a_by_span = {(round(s.start, 2), round(s.end, 2)): s for s in again}

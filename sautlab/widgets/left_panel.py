@@ -52,12 +52,6 @@ class VideoSourceCard(Card):
         super().__init__("Video Source", "video-outline")
         self.url = QLineEdit()
         self.url.setPlaceholderText("Paste a video link here...")
-        self.dataset_label = QLabel("Kaggle Dataset Name")
-        self.dataset_label.setObjectName("muted")
-        self.dataset = QLineEdit()
-        self.dataset.setPlaceholderText("Kaggle dataset slug (e.g. my-arabic-corpus)")
-        self.dataset_label.hide()
-        self.dataset.hide()
         self.btn = QPushButton("  Download")
         self.btn.setObjectName("primary")
         self.btn.setIcon(icon("download", "#ffffff"))
@@ -68,22 +62,13 @@ class VideoSourceCard(Card):
         self.progress.hide()
         self.msg = QLabel("")
         self.msg.setObjectName("muted")
-        self.msg.setWordWrap(True)
         self.msg.hide()
         self.body.addWidget(self.url)
-        self.body.addWidget(self.dataset_label)
-        self.body.addWidget(self.dataset)
         self.body.addWidget(self.btn)
         self.body.addWidget(self.progress)
         self.body.addWidget(self.msg)
         self.btn.clicked.connect(self._clicked)
         self.url.returnPressed.connect(self._clicked)
-
-    def set_dataset_controls(self, visible: bool, default_name: str = "") -> None:
-        self.dataset_label.setVisible(visible)
-        self.dataset.setVisible(visible)
-        if default_name:
-            self.dataset.setText(default_name)
 
     def _clicked(self) -> None:
         text = self.url.text().strip()
@@ -103,7 +88,6 @@ class VideoSourceCard(Card):
     def set_busy(self, busy: bool, fraction: float = 0.0, text: str = "") -> None:
         self.btn.setEnabled(not busy)
         self.url.setEnabled(not busy)
-        self.dataset.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.progress.setValue(int(fraction * 100))
         if busy:
