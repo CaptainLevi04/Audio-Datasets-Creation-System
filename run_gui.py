@@ -8,6 +8,7 @@
 The data folder has the same layout as the runner notebook (one folder per video).
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,10 @@ def main() -> int:
     ap.add_argument("--snr-threshold", type=float, default=25.0, help="clean/noisy cut-off in dB (default 25)")
     ap.add_argument("--device", choices=["cuda", "cpu"], default=None, help="device for the AST model")
     ap.add_argument("--cookies", default=None, help="YouTube cookies.txt, if YouTube blocks the download")
+    ap.add_argument("--kaggle-url", default=os.environ.get("SAUTLAB_KAGGLE_URL"),
+                    help="remote Kaggle GPU server URL from main-runner.ipynb (or set SAUTLAB_KAGGLE_URL)")
+    ap.add_argument("--import-zip", default=None,
+                    help="unpack a Kaggle output .zip (compact or full) into --data-dir and hydrate locally")
     ap.add_argument("--mock", action="store_true", help="use fake data instead of the real backend")
     args = ap.parse_args()
 
@@ -40,22 +45,46 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    backend_factory = None
     try:
         if args.mock:
             from sautlab.backend.mock import MockBackend
 
             backend = MockBackend(args.data_dir if args.data_dir != "corpus_data" else "mock_workspace")
         else:
-            from sautlab.backend.corpus import CorpusBackend
+            from sautlab.backend.remote_kaggle import RemoteKaggleBackend
+            from sautlab.kaggle_bridge import unpack_corpus_archive
 
-            backend = CorpusBackend(
-                args.data_dir, classifier=args.classifier, vad=args.vad, snr_threshold=args.snr_threshold,
-                cookies_file=args.cookies, device=args.device,
+            if args.import_zip:
+                unpack_corpus_archive(args.import_zip, args.data_dir, hydrate=True)
+
+            kaggle_url = args.kaggle_url
+
+            def backend_factory(folder: str | Path) -> RemoteKaggleBackend:
+                cur_url = getattr(backend, "remote_url", kaggle_url)
+                return RemoteKaggleBackend(
+                    folder,
+                    remote_url=cur_url,
+                    classifier=args.classifier,
+                    vad=args.vad,
+                    snr_threshold=args.snr_threshold,
+                    cookies_file=args.cookies,
+                    device=args.device,
+                )
+
+            backend = RemoteKaggleBackend(
+                args.data_dir,
+                remote_url=kaggle_url,
+                classifier=args.classifier,
+                vad=args.vad,
+                snr_threshold=args.snr_threshold,
+                cookies_file=args.cookies,
+                device=args.device,
             )
     except ImportError as e:
         QMessageBox.critical(None, "SautLab", f"{e}\n\nInstall the requirements with:\n  pip install -r requirements-gui.txt\n\nOr start with --mock to try the GUI with fake data.")
         return 1
-    win = MainWindow(backend, user)
+    win = MainWindow(backend, user, backend_factory=backend_factory)
     win.show()
     return app.exec()
 

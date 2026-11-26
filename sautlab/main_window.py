@@ -225,6 +225,8 @@ class MainWindow(QMainWindow):
         a_quit = self._act("Quit", self.close, "Ctrl+Q")
         if self.backend_factory is not None:
             m["Project"].menu().addAction(self._act("Open data folder...", self._open_data_folder, "Ctrl+O", "folder-open-outline"))
+        if hasattr(self.backend, "import_kaggle_zip"):
+            m["Project"].menu().addAction(self._act("Import Kaggle output zip...", self._import_kaggle_zip, None, "folder-open-outline"))
         m["Project"].menu().addActions([self.a_save])
         m["Project"].menu().addSeparator()
         m["Project"].menu().addAction(a_quit)
@@ -236,6 +238,8 @@ class MainWindow(QMainWindow):
 
         self.a_run = self._act("Run pipeline on this video", self._run_pipeline, "Ctrl+R", "play")
         m["Processing"].menu().addAction(self.a_run)
+        if hasattr(self.backend, "pull_remote_videos"):
+            m["Processing"].menu().addAction(self._act("Pull finished videos from Kaggle...", self._pull_from_kaggle, None, "download"))
         self.a_rerun = self._act("Recompute SNR for selected segment", self._reprocess_selected, None, "refresh")
         a_asr = self._act("Import ASR results (Kaggle segments.csv)...", self._import_asr, None, "file-export-outline")
         m["Processing"].menu().addActions([self.a_rerun, a_asr])
@@ -285,6 +289,8 @@ class MainWindow(QMainWindow):
                 cm.addAction(a)
         if hasattr(self.backend, "cookies_file"):
             sm.addAction(self._act("YouTube cookies.txt...", self._set_cookies))
+        if hasattr(self.backend, "remote_url"):
+            sm.addAction(self._act("Kaggle Remote Server URL...", self._set_kaggle_url))
         ctx = sm.addMenu("Listen-around-cut context")
         grp = QActionGroup(self)
         for sec in (1.0, 1.5, 2.0, 3.0):
@@ -472,6 +478,76 @@ class MainWindow(QMainWindow):
         if path:
             self.backend.cookies_file = path
             self.c.log_info("YouTube cookies file set.")
+
+    def _set_kaggle_url(self) -> None:
+        if not hasattr(self.backend, "remote_url"):
+            return
+        cur = getattr(self.backend, "remote_url", None) or ""
+        url, ok = QInputDialog.getText(
+            self,
+            "Kaggle Remote Server URL",
+            "Public URL printed by main-runner.ipynb (leave blank for local execution):",
+            text=cur,
+        )
+        if not ok:
+            return
+        cleaned = url.strip().rstrip("/") or None
+        self.backend.remote_url = cleaned
+        if not cleaned:
+            self.c.log_info("Switched to local backend execution.", kind="info")
+            return
+        self.c.log_info(f"Checking Kaggle server at {cleaned} ...", kind="info")
+        w = Worker(lambda _prog: self.backend.check_health())
+        w.done.connect(
+            lambda info: self.c.log_info(
+                f"Connected to Kaggle GPU server: {info.get('device', 'unknown')} | "
+                f"cookies={'yes' if info.get('has_cookies') else 'no'} | videos={info.get('videos_count', 0)}",
+                kind="ok",
+            )
+        )
+        w.failed.connect(self._worker_failed("Could not reach Kaggle Remote Server"))
+        self._run_worker(w)
+
+    def _import_kaggle_zip(self) -> None:
+        if not hasattr(self.backend, "import_kaggle_zip"):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Kaggle corpus archive (corpus_final_output.zip)", "", "ZIP archives (*.zip)"
+        )
+        if not path:
+            return
+        if self.c.dirty:
+            self.c.save()
+        self.c.log_info(f"Importing & hydrating {Path(path).name} ...", kind="info")
+        w = Worker(lambda _prog: self.backend.import_kaggle_zip(path))
+        w.done.connect(lambda vids: self._kaggle_imported(vids, source="Kaggle archive"))
+        w.failed.connect(self._worker_failed("Could not import Kaggle archive"))
+        self._run_worker(w)
+
+    def _pull_from_kaggle(self) -> None:
+        if not hasattr(self.backend, "pull_remote_videos"):
+            return
+        if not getattr(self.backend, "is_remote", False):
+            self._set_kaggle_url()
+            if not getattr(self.backend, "is_remote", False):
+                return
+        if self.c.dirty:
+            self.c.save()
+        self.c.log_info("Pulling compact FLAC + CSV bundles from Kaggle...", kind="info")
+        w = Worker(lambda prog: self.backend.pull_remote_videos(progress=prog))
+        w.progress.connect(lambda _f, m: self.c.log_info(m, kind="info") if m else None)
+        w.done.connect(lambda vids: self._kaggle_imported(vids, source="Kaggle server"))
+        w.failed.connect(self._worker_failed("Could not pull videos from Kaggle"))
+        self._run_worker(w)
+
+    def _kaggle_imported(self, vids: list[str], source: str) -> None:
+        self.c.refresh_videos()
+        self._refresh_videos()
+        if vids:
+            self._select_video(vids[0])
+            self.c.log_info(f"Loaded {len(vids)} video(s) from {source}: {', '.join(vids)}", kind="ok")
+        else:
+            self.c.log_info(f"No video folders found in {source}.", kind="warn")
 
     def _extract_clicked(self, sr: int, ch: int) -> None:
         if self.c.video:

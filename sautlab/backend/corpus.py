@@ -122,25 +122,27 @@ class CorpusBackend(Backend):
         out = []
         for p in sorted(self.root.iterdir()):
             # YouTube ids may start with "_" or "-", so only hidden folders are skipped
-            if p.is_dir() and not p.name.startswith(".") and ((p / "audio.wav").exists() or (p / "info.json").exists()):
+            if p.is_dir() and not p.name.startswith(".") and (
+                (p / "audio.wav").exists() or (p / "audio_conditioned.flac").exists() or (p / "info.json").exists()
+            ):
                 out.append(p)
         return out
 
     def _duration(self, vdir: Path, info: dict) -> float:
-        wav = vdir / "audio.wav"
-        if wav.exists():
-            mt = wav.stat().st_mtime
-            cached = self._dur_cache.get(str(wav))
-            if cached and cached[0] == mt:
-                return cached[1]
-            try:
-                import soundfile as sf
+        for cand in (vdir / "audio.wav", vdir / "audio_conditioned.flac"):
+            if cand.exists():
+                mt = cand.stat().st_mtime
+                cached = self._dur_cache.get(str(cand))
+                if cached and cached[0] == mt:
+                    return cached[1]
+                try:
+                    import soundfile as sf
 
-                d = float(sf.info(str(wav)).duration)
-                self._dur_cache[str(wav)] = (mt, d)
-                return d
-            except Exception:
-                pass
+                    d = float(sf.info(str(cand)).duration)
+                    self._dur_cache[str(cand)] = (mt, d)
+                    return d
+                except Exception:
+                    pass
         return float(info.get("duration_s") or 0.0)
 
     def _csv_flags(self, path: Path) -> dict:
@@ -181,16 +183,18 @@ class CorpusBackend(Backend):
         def done(key: str, path: Path) -> None:
             steps[key] = {"state": "done", "info": _stamp(path)}
 
-        for p in (vdir / "info.json", vdir / "audio.wav"):
+        for p in (vdir / "info.json", vdir / "audio.wav", vdir / "audio_conditioned.flac"):
             if p.exists():
                 done("download", p)
                 break
         if (vdir / "audio.wav").exists():
             done("extract", vdir / "audio.wav")
+        elif (vdir / "audio_conditioned.flac").exists():
+            done("extract", vdir / "audio_conditioned.flac")
         if (vdir / "regions.csv").exists():
             done("region_labels", vdir / "regions.csv")
         seg_csv = next((vdir / n for n in ("segments_student1.csv", "segments.csv") if (vdir / n).exists()), None)
-        if seg_csv is not None and (vdir / "segments").is_dir():
+        if seg_csv is not None and ((vdir / "segments").is_dir() or (vdir / "audio_conditioned.flac").exists()):
             done("segmentation", seg_csv)
         main = vdir / "segments.csv"
         flags = self._csv_flags(main)
@@ -217,7 +221,12 @@ class CorpusBackend(Backend):
             v.license = info.get("license") or "-"
             v.url = info.get("webpage_url") or info.get("url") or ""
             v.duration = self._duration(vdir, info)
-            v.audio_path = str(vdir / "audio.wav") if (vdir / "audio.wav").exists() else None
+            if (vdir / "audio.wav").exists():
+                v.audio_path = str(vdir / "audio.wav")
+            elif (vdir / "audio_conditioned.flac").exists():
+                v.audio_path = str(vdir / "audio_conditioned.flac")
+            else:
+                v.audio_path = None
             v.steps = self._steps(vid, vdir)
             fl = self._csv_flags(vdir / "segments.csv")
             v.progress = (fl["accepted"] / fl["text"]) if fl["text"] else 0.0
@@ -290,7 +299,22 @@ class CorpusBackend(Backend):
         return str(wav)
 
     def audio_path(self, video_id: str) -> str:
-        return str(self._dir(video_id) / "audio.wav")
+        vdir = self._dir(video_id)
+        wav = vdir / "audio.wav"
+        if not wav.exists() and (vdir / "audio_conditioned.flac").exists():
+            from ..kaggle_bridge import hydrate_video_dir
+
+            hydrate_video_dir(vdir, slice_segments=False)
+        return str(wav)
+
+    def import_kaggle_zip(self, zip_path: str | Path) -> list[str]:
+        """Extract a compact or full Kaggle output archive into `self.root` and hydrate audio."""
+        from ..kaggle_bridge import unpack_corpus_archive
+
+        vids = unpack_corpus_archive(zip_path, self.root, hydrate=True)
+        self._flags_cache.clear()
+        self.list_videos()
+        return vids
 
     def load_audio(self, video_id: str) -> tuple[np.ndarray, int]:
         import speech_corpus as sc
@@ -329,6 +353,10 @@ class CorpusBackend(Backend):
 
     def load_segments(self, video_id: str) -> list[Segment]:
         vdir = self._dir(video_id)
+        if not (vdir / "segments").is_dir() and ((vdir / "audio.wav").exists() or (vdir / "audio_conditioned.flac").exists()):
+            from ..kaggle_bridge import hydrate_video_dir
+
+            hydrate_video_dir(vdir, slice_segments=True)
         path = next((vdir / n for n in ("segments.csv", "segments_snr.csv", "segments_student1.csv") if (vdir / n).exists()), None)
         if path is None:
             return []
