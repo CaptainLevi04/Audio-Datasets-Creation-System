@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
         self.c.refresh_videos()
         self._refresh_videos()
         if vids:
+            self.c.video = None
             self._select_video(vids[0])
             self.c.log_info(f"Loaded {len(vids)} video(s) from {source}: {', '.join(vids)}", kind="ok")
         else:
