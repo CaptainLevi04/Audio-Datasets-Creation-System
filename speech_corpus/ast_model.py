@@ -28,13 +28,45 @@ AST_HOP_S = 5.0
 MIXED_SP_THR = 0.40
 MIXED_MU_THR = 0.30
 SILENCE_DB_ABOVE_FLOOR = 4.0
+SILENCE_MAX_DB = -28.0
+SILENCE_HARD_DB = -42.0
 MIN_REGION_S = 2.0
 SNAP_WINDOW_S = 2.5
 ALLOW_HEURISTIC_FALLBACK = False
 
-SPEECH_NAMES = {"speech", "male speech, man speaking", "female speech, woman speaking",
-                "child speech, kid speaking", "conversation", "narration, monologue"}
+RECITATION_NAMES = {"chant", "mantra"}
+SPEECH_NAMES = {
+    "speech",
+    "male speech, man speaking",
+    "female speech, woman speaking",
+    "child speech, kid speaking",
+    "conversation",
+    "narration, monologue",
+} | RECITATION_NAMES
 MUSIC_NAMES = {"music", "musical instrument", "singing", "song"}
+INSTRUMENT_NAMES = {
+    "musical instrument",
+    "plucked string instrument",
+    "keyboard (musical)",
+    "rattle (instrument)",
+    "brass instrument",
+    "bowed string instrument",
+    "wind instrument, woodwind instrument",
+    "drum",
+    "drum machine",
+    "bass drum",
+    "guitar",
+    "piano",
+    "synthesizer",
+    "electronic music",
+    "background music",
+    "pop music",
+    "rock music",
+    "hip hop music",
+    "classical music",
+    "jazz",
+    "dubstep",
+}
 SILENCE_NAMES = {"silence"}
 
 
@@ -57,7 +89,11 @@ class ASTInferenceEngine:
             self.model = AutoModelForAudioClassification.from_pretrained(self.model_id).to(self.device).eval()
             id2label = {int(k): str(v).lower() for k, v in self.model.config.id2label.items()}
             self.speech_ids = [i for i, l in id2label.items() if l in SPEECH_NAMES]
+            self.recitation_ids = [i for i, l in id2label.items() if l in RECITATION_NAMES]
             self.music_ids = [i for i, l in id2label.items() if l in MUSIC_NAMES]
+            self.instrument_ids = [
+                i for i, l in id2label.items() if "instrument" in l or l in INSTRUMENT_NAMES
+            ]
             self.silence_ids = [i for i, l in id2label.items() if l in SILENCE_NAMES]
             if not (self.speech_ids and self.music_ids and self.silence_ids):
                 raise RuntimeError("Could not find Speech/Music/Silence classes in model.config.id2label")
@@ -90,11 +126,16 @@ class ASTInferenceEngine:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             probs = torch.sigmoid(self.model(**inputs).logits).cpu().numpy()
-        return np.stack([
-            probs[:, self.speech_ids].max(1),
-            probs[:, self.music_ids].max(1),
-            probs[:, self.silence_ids].max(1)
-        ], axis=1)
+        p_sp = probs[:, self.speech_ids].max(1)
+        p_mu = probs[:, self.music_ids].max(1)
+        p_si = probs[:, self.silence_ids].max(1)
+        # AudioSet assigns parent "Music" leakage onto unaccompanied vocal recitation ("Chant"/"Mantra").
+        if self.recitation_ids:
+            p_recite = probs[:, self.recitation_ids].max(1)
+            p_inst = probs[:, self.instrument_ids].max(1) if self.instrument_ids else np.zeros_like(p_recite)
+            unaccompanied = (p_recite >= 0.25) & (p_inst < 0.10) & (p_recite >= 0.5 * p_mu)
+            p_mu = np.where(unaccompanied, np.minimum(p_mu, 0.25), p_mu)
+        return np.stack([p_sp, p_mu, p_si], axis=1)
 
 
 _AST_CACHE = {}
@@ -108,15 +149,21 @@ def get_ast_engine(device: Optional[str] = None, allow_fallback: bool = False) -
 
 
 def decide_window(p_sp: float, p_mu: float, p_si: float, rms_db: float, floor_db: float) -> dict:
-    """Rule-based window label. Silence is decided by acoustic ENERGY; mixed = speech AND music both present."""
+    """Rule-based window label. Silence uses guarded acoustic ENERGY; mixed = speech AND music both present."""
     p_mix = float(np.sqrt(p_sp * p_mu))
     scores = {"speech": p_sp, "music": p_mu, "mixed": p_mix, "silence": p_si}
     sil_thr = floor_db + SILENCE_DB_ABOVE_FLOOR
+    is_hard_silence = rms_db < SILENCE_HARD_DB
+    is_quiet_silence = (
+        rms_db < min(sil_thr, SILENCE_MAX_DB)
+        and (p_si >= 0.25 or (p_sp < 0.25 and p_mu < 0.25))
+    )
 
-    if rms_db < sil_thr:
+    if is_hard_silence or is_quiet_silence:
         lbl = "silence"
         scores["silence"] = max(p_si, 0.9)
-        cert = float(np.clip((sil_thr - rms_db) / SILENCE_DB_ABOVE_FLOOR, 0, 1))
+        thr_ref = SILENCE_HARD_DB if is_hard_silence else min(sil_thr, SILENCE_MAX_DB)
+        cert = float(np.clip((thr_ref - rms_db) / SILENCE_DB_ABOVE_FLOOR, 0, 1))
     elif p_sp >= MIXED_SP_THR and p_mu >= MIXED_MU_THR:
         lbl = "mixed"
         cert = float(np.clip(min(p_sp / MIXED_SP_THR, p_mu / MIXED_MU_THR) - 1.0, 0, 1))

@@ -315,6 +315,25 @@ class LocalDualAsrTests(unittest.TestCase):
                 backend.run_pipeline(vi.id, lambda _f, _m="": None)
             load_cached_mock.assert_not_called()
 
+    def test_ast_recitation_mapping_and_silence_guard(self) -> None:
+        self.assertIn("chant", ast_model.SPEECH_NAMES)
+        self.assertIn("mantra", ast_model.SPEECH_NAMES)
+
+        # Unaccompanied melodic recitation at -19 dB must NOT be misclassified as silence
+        # even when a high continuous noise floor produces sil_thr around -18.3 dB.
+        d_recite = ast_model.decide_window(p_sp=0.61, p_mu=0.14, p_si=0.0, rms_db=-18.95, floor_db=-22.27)
+        self.assertEqual(d_recite["pred_content"], "speech")
+
+        # True quiet or digital silence still maps cleanly to silence.
+        d_quiet = ast_model.decide_window(p_sp=0.05, p_mu=0.03, p_si=0.40, rms_db=-35.0, floor_db=-37.0)
+        self.assertEqual(d_quiet["pred_content"], "silence")
+        d_hard = ast_model.decide_window(p_sp=0.10, p_mu=0.05, p_si=0.80, rms_db=-55.0, floor_db=-60.0)
+        self.assertEqual(d_hard["pred_content"], "silence")
+
+        # Vocal+music outro at -33 dB with strong music/speech probs must not become silence.
+        d_outro = ast_model.decide_window(p_sp=0.58, p_mu=0.61, p_si=0.018, rms_db=-33.2, floor_db=-32.9)
+        self.assertEqual(d_outro["pred_content"], "mixed")
+
 
 if __name__ == "__main__":
     unittest.main()
