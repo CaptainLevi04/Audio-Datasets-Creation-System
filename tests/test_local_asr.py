@@ -334,6 +334,46 @@ class LocalDualAsrTests(unittest.TestCase):
         d_outro = ast_model.decide_window(p_sp=0.58, p_mu=0.61, p_si=0.018, rms_db=-33.2, floor_db=-32.9)
         self.assertEqual(d_outro["pred_content"], "mixed")
 
+    def test_dp_preserves_real_pauses_with_rank4_valley_fallback_and_word_guard(self) -> None:
+        from speech_corpus.cut_engine_v2 import PauseCandidate, plan_unified_dp_cuts, verify_candidates_with_words
+
+        c_strong1 = PauseCandidate(
+            t=8.0, p_start=7.8, p_end=8.2, duration=0.4,
+            vote_class="STRONG", vote_count=2.0, energy_vote=1, silero_vote=1, whisper_vote=0,
+            energy_margin_db=8.0, silero_margin=0.4, is_accepted=True, needs_review=0, review_reason="none",
+        )
+        c_strong2 = PauseCandidate(
+            t=17.5, p_start=17.3, p_end=17.7, duration=0.4,
+            vote_class="STRONG", vote_count=2.0, energy_vote=1, silero_vote=1, whisper_vote=0,
+            energy_margin_db=8.0, silero_margin=0.4, is_accepted=True, needs_review=0, review_reason="none",
+        )
+        # 21s gap after 17.5 bridged by one FALLBACK_SPLIT candidate at 28.0 -> total 38.5s.
+        c_fb = PauseCandidate(
+            t=28.0, p_start=27.9, p_end=28.1, duration=0.2,
+            vote_class="FALLBACK_SPLIT", vote_count=0.0, energy_vote=0, silero_vote=0, whisper_vote=0,
+            energy_margin_db=-1.0, silero_margin=-0.2, is_accepted=False, needs_review=1,
+            review_reason="fallback_split", weak=True,
+        )
+        segs, tag = plan_unified_dp_cuts(38.5, [c_strong1, c_strong2, c_fb], transitions=[])
+        self.assertNotEqual(tag, "blind_cut_emergency")
+        self.assertEqual([s["end"] for s in segs], [8.0, 17.5, 28.0, 38.5])
+
+        # Stretched Whisper word timestamp must not mark a genuine STRONG acoustic pause as word_boundary_risk.
+        c_weak = PauseCandidate(
+            t=3.0, p_start=2.95, p_end=3.05, duration=0.1,
+            vote_class="WEAK", vote_count=1.0, energy_vote=1, silero_vote=0, whisper_vote=0,
+            energy_margin_db=1.0, silero_margin=0.0, is_accepted=False, needs_review=1,
+            review_reason="weak_pause", weak=True,
+        )
+        words = [
+            {"start": 2.8, "end": 3.25, "word": "كلمة"},       # short word <0.60s overlapping c_weak
+            {"start": 7.0, "end": 8.6, "word": "ممتدة"},        # stretched >=0.60s across STRONG pause at 8.0s
+        ]
+        out_cands, risks, _ = verify_candidates_with_words([c_weak, c_strong1], words)
+        self.assertEqual(risks, 1)
+        self.assertTrue(out_cands[0].word_risk)
+        self.assertFalse(out_cands[1].word_risk)
+
 
 if __name__ == "__main__":
     unittest.main()

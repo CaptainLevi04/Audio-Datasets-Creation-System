@@ -328,7 +328,8 @@ def transcribe_words(model: Any, audio_slice: np.ndarray, offset: float) -> List
 def verify_candidates_with_words(cands: List[PauseCandidate],
                                  words: List[dict]) -> Tuple[List[PauseCandidate], int, int]:
     """Verify candidate cut midpoints against Whisper word timestamps.
-    If a candidate cut lands inside an active word, flag word risk.
+    faster-whisper stretches word end timestamps across acoustic silences, so multi-detector
+    or long-span boundaries remain valid; only short active phonation (<0.60 s) on weak cuts flags risk.
     """
     if not words:
         return cands, 0, 0
@@ -339,18 +340,20 @@ def verify_candidates_with_words(cands: List[PauseCandidate],
         prev_w = words[i - 1] if i > 0 else None
         next_w = words[i] if i < len(words) else None
 
-        # Check if candidate cut midpoint lands strictly inside an active word
-        if prev_w and prev_w["start"] + 0.05 < c.t < prev_w["end"] - 0.05:
-            c.word_ok = 0.0
-            c.word_risk = True
-            c.needs_review = 1
-            c.review_reason = "word_boundary_risk"
-            risks += 1
-            continue
+        # Check if a weak/unconfirmed cut lands strictly inside active phonation of a non-stretched word.
+        if prev_w and (c.weak or c.vote_count < 2):
+            w_len = prev_w["end"] - prev_w["start"]
+            if w_len < 0.60 and prev_w["start"] + 0.05 < c.t < prev_w["end"] - 0.05:
+                c.word_ok = 0.0
+                c.word_risk = True
+                c.needs_review = 1
+                c.review_reason = "word_boundary_risk"
+                risks += 1
+                continue
 
         c.word_ok = 1.0
         verified += 1
-        if next_w and 0.0 <= next_w["start"] - c.p_end <= 0.08 and next_w["word"].strip().startswith(ARABIC_STOPS):
+        if next_w and (c.short or c.weak) and 0.0 <= next_w["start"] - c.p_end <= 0.08 and next_w["word"].strip().startswith(ARABIC_STOPS):
             c.word_risk = True
 
     return cands, risks, verified
@@ -422,36 +425,68 @@ def build_unified_candidates(audio: np.ndarray, sr: int = DEFAULT_SR,
             num_detectors=num_det
         ))
 
-    # Handle gaps > 15 s between candidates: verify against detector grid
-    # Issue 1: A cut inside continuous silence is valid as automatic voting cut ONLY IF
-    # its exact timestamp maps to a genuine Accepted Voting Candidate in the grid.
+    # Handle gaps > 15 s between candidates: prefer quietest inter-word gap, else local energy valley.
     cands_sorted = sorted(cands, key=lambda c: c.t)
     anchor_times = [0.0] + [c.t for c in cands_sorted] + [total_dur]
     extra_cands = []
-    
+
     for a, b in zip(anchor_times[:-1], anchor_times[1:]):
         gap = b - a
         if gap > PRIMARY_MAX:
             n_extra = int(np.ceil(gap / TARGET_LEN)) - 1
+            step = gap / (n_extra + 1)
+            prev_t = a
             for vi in range(1, n_extra + 1):
-                nominal_t = a + vi * (gap / (n_extra + 1))
-                # Search within +/- 1.0s for local energy minimum
-                k0 = max(0, int((nominal_t - 1.0) / 0.010))
-                k1 = min(len(energy_db), int((nominal_t + 1.0) / 0.010))
-                if k1 > k0:
-                    best_k = k0 + int(np.argmin(energy_db[k0:k1]))
-                    cut_t = round(float(times[best_k]), 3)
-                else:
-                    cut_t = round(nominal_t, 3)
-                
-                # Check grid support for this candidate cut timestamp
+                nominal_t = a + vi * step
+                lo_c = max(prev_t + FALLBACK_MIN, nominal_t - 1.5)
+                hi_c = min(b - FALLBACK_MIN * (n_extra - vi + 1), nominal_t + 1.5)
+                if vi == 1:
+                    hi_c = min(hi_c, a + FALLBACK_MAX - 0.1)
+                if vi == n_extra:
+                    lo_c = max(lo_c, b - FALLBACK_MAX + 0.1)
+                if hi_c < lo_c:
+                    lo_c = hi_c = nominal_t
+
+                cut_t = None
+                p_s, p_e = max(0.0, nominal_t - 0.100), min(total_dur, nominal_t + 0.100)
+                if word_timestamps:
+                    best_gap = None
+                    for wk in range(len(word_timestamps) - 1):
+                        g0 = float(word_timestamps[wk].get("end", 0.0))
+                        g1 = float(word_timestamps[wk + 1].get("start", 0.0))
+                        g_mid = 0.5 * (g0 + g1)
+                        if g1 - g0 >= 0.02 and lo_c <= g_mid <= hi_c:
+                            e0 = int(np.searchsorted(times, g0))
+                            e1 = max(e0 + 1, int(np.searchsorted(times, g1)))
+                            m_e = float(energy_db[e0:min(len(energy_db), e1)].mean()) if e0 < len(energy_db) else 0.0
+                            if best_gap is None or m_e < best_gap[0]:
+                                best_gap = (m_e, g0, g1, g_mid)
+                    if best_gap is not None:
+                        _, g0, g1, g_mid = best_gap
+                        cut_t = round(g_mid, 3)
+                        p_s, p_e = max(0.0, round(g0, 3)), min(total_dur, round(g1, 3))
+
+                if cut_t is None:
+                    k0 = max(0, int(max(lo_c, nominal_t - 1.0) / 0.010))
+                    k1 = min(len(energy_db), int(min(hi_c, nominal_t + 1.0) / 0.010))
+                    if k1 > k0:
+                        best_k = k0 + int(np.argmin(energy_db[k0:k1]))
+                        cut_t = round(float(times[best_k]), 3)
+                    else:
+                        cut_t = round(nominal_t, 3)
+                    p_s, p_e = max(0.0, round(cut_t - 0.100, 3)), min(total_dur, round(cut_t + 0.100, 3))
+
+                prev_t = cut_t
                 grid_info = evaluate_cut_grid_support(grid_df, cut_t)
                 is_grid_accepted = grid_info["is_accepted"]
+                v_cls = grid_info["vote_class"]
+                if not is_grid_accepted and v_cls not in ("WEAK", "WHISPER_ONLY"):
+                    v_cls = "FALLBACK_SPLIT"
 
                 extra_cands.append(PauseCandidate(
-                    t=cut_t, p_start=max(0.0, cut_t - 0.100), p_end=min(total_dur, cut_t + 0.100),
-                    duration=0.200,
-                    vote_class=grid_info["vote_class"],
+                    t=cut_t, p_start=p_s, p_end=p_e,
+                    duration=round(max(0.02, p_e - p_s), 3),
+                    vote_class=v_cls,
                     vote_count=grid_info["vote_count"],
                     energy_vote=grid_info["energy_vote"],
                     silero_vote=grid_info["silero_vote"],
@@ -464,7 +499,7 @@ def build_unified_candidates(audio: np.ndarray, sr: int = DEFAULT_SR,
                     pause_id=f"SYNTH_{len(extra_cands)+1:03d}",
                     grid_bin_index=grid_info["grid_bin_index"],
                     weak=not is_grid_accepted,
-                    short=False
+                    short=(p_e - p_s) < 0.200,
                 ))
 
     all_cands = sorted(cands + extra_cands, key=lambda c: c.t)
@@ -631,6 +666,14 @@ def plan_unified_dp_cuts(total_dur: float,
         path = _dp_solve(nodes_3, FALLBACK_MIN, FALLBACK_MAX, transitions)
         plan_tag = "weak_pause_fallback"
         nodes_used = nodes_3
+
+    # Stage 3b: Allow penalized fallback/valley splits (rank 4) only across pause-free stretches
+    # so one long (>17 s) stretch never forces blind_cut_emergency over the whole audio.
+    if path is None and len(all_cands) > len(weak_cands):
+        nodes_4 = [(0.0, None)] + [(c.t, c) for c in all_cands] + [(total_dur, None)]
+        path = _dp_solve(nodes_4, FALLBACK_MIN, FALLBACK_MAX, transitions)
+        plan_tag = "valley_fallback"
+        nodes_used = nodes_4
 
     # Stage 4: Emergency equal split if no valid pause cut can be found
     if path is None:
