@@ -799,3 +799,114 @@ def run_dual_asr_on_video_dir(
                 encoding="utf-8",
             )
     return df_out
+
+
+# ---------------------------------------------------------------------
+# 4. General Kaggle Dataset Slug & Transfer Helpers (Pure CLI Mode)
+# ---------------------------------------------------------------------
+
+def sanitize_dataset_slug(name: str, default: str = "sautlab-corpus") -> str:
+    """Normalize arbitrary dataset title into a valid 6..50 char Kaggle dataset slug."""
+    raw = str(name or "").strip()
+    if "/" in raw:
+        raw = raw.split("/")[-1]
+    slug = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    if not slug:
+        slug = default
+    if len(slug) < 6:
+        slug = f"sautlab-{slug}"
+    return slug[:50].strip("-") or default
+
+
+def upload_files_to_kaggle_dataset(
+    slug: str,
+    files: dict[str, Path | str | bytes],
+    title: str | None = None,
+    version_notes: str = "Update from SautLab",
+    public: bool = False,
+) -> str:
+    """Create or update a Kaggle dataset `<username>/<slug>` with the given `{filename: content}` map."""
+    import tempfile
+
+    api, username = _get_authenticated_kaggle_api()
+    if api is None or not username:
+        raise RuntimeError("Kaggle API authentication is not configured (~/.kaggle/access_token or KAGGLE_API_TOKEN).")
+
+    clean_slug = sanitize_dataset_slug(slug)
+    dataset_id = f"{username}/{clean_slug}"
+    ds_title = (title or clean_slug.replace("-", " ").title())[:80]
+
+    with tempfile.TemporaryDirectory(prefix="sautlab_ds_") as tmp:
+        tmp_dir = Path(tmp)
+        for fname, src in files.items():
+            dst = tmp_dir / Path(fname).name
+            if isinstance(src, bytes):
+                dst.write_bytes(src)
+            elif isinstance(src, str) and not Path(src).exists():
+                dst.write_text(src, encoding="utf-8")
+            else:
+                shutil.copy2(Path(src), dst)
+
+        meta = {
+            "title": ds_title,
+            "id": dataset_id,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        (tmp_dir / "dataset-metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        exists = False
+        try:
+            api.dataset_list_files(dataset_id)
+            exists = True
+        except Exception:
+            try:
+                found = api.dataset_list(user=username, search=clean_slug)
+                exists = any(getattr(d, "ref", "") == dataset_id for d in found)
+            except Exception:
+                exists = False
+
+        if exists:
+            api.dataset_create_version(
+                str(tmp_dir),
+                version_notes=version_notes,
+                quiet=True,
+                convert_to_csv=False,
+            )
+        else:
+            api.dataset_create_new(
+                str(tmp_dir),
+                public=bool(public),
+                quiet=True,
+                convert_to_csv=False,
+            )
+    return dataset_id
+
+
+def download_file_from_kaggle_dataset(
+    dataset_id: str,
+    file_name: str,
+    dest_dir: str | Path,
+) -> Path | None:
+    """Download a single file from `<username>/<slug>` into `dest_dir` cleanly."""
+    api, username = _get_authenticated_kaggle_api()
+    if api is None or not username:
+        return None
+    ds_ref = dataset_id if "/" in dataset_id else f"{username}/{sanitize_dataset_slug(dataset_id)}"
+    dst = Path(dest_dir)
+    dst.mkdir(parents=True, exist_ok=True)
+    target = dst / Path(file_name).name
+    target.unlink(missing_ok=True)
+    zip_target = dst / f"{Path(file_name).name}.zip"
+    zip_target.unlink(missing_ok=True)
+    try:
+        api.dataset_download_file(ds_ref, file_name, path=str(dst), force=True, quiet=True)
+    except Exception:
+        return None
+    if zip_target.exists() and not target.exists():
+        try:
+            with zipfile.ZipFile(zip_target, "r") as zf:
+                zf.extractall(dst)
+        finally:
+            zip_target.unlink(missing_ok=True)
+    return target if target.exists() else None

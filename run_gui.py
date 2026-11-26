@@ -28,13 +28,19 @@ def main() -> int:
     ap.add_argument("--device", choices=["cuda", "cpu"], default=None, help="device for the AST model")
     ap.add_argument("--cookies", default=None, help="YouTube cookies.txt, if YouTube blocks the download")
     ap.add_argument("--kaggle-url", default=os.environ.get("SAUTLAB_KAGGLE_URL"),
-                    help="remote Kaggle GPU server URL from main-runner.ipynb (or set SAUTLAB_KAGGLE_URL)")
+                    help="remote Kaggle HTTP server URL if using live tunnel mode (optional)")
+    ap.add_argument("--dataset", default="sautlab-corpus",
+                    help="default Kaggle dataset slug created/updated in Kaggle CLI mode (default: sautlab-corpus)")
+    ap.add_argument("--kernel", default="main-runner",
+                    help="Kaggle kernel slug for CLI mode (default: main-runner)")
+    ap.add_argument("--cookies-dataset", default="yt-cookies",
+                    help="Kaggle cookies dataset name (default: yt-cookies)")
     ap.add_argument("--endpoint-slug", default="sautlab-endpoint",
                     help="private Kaggle dataset slug for Auto-Beacon discovery (default: sautlab-endpoint)")
     ap.add_argument("--no-auto-beacon", action="store_true",
                     help="disable automatic connection to private Kaggle Auto-Beacon")
     ap.add_argument("--local", action="store_true",
-                    help="allow falling back to local CPU Steps 1-5 if Kaggle server is offline")
+                    help="run Steps 1-5 on local CPU instead of Kaggle CLI")
     ap.add_argument("--import-zip", default=None,
                     help="unpack a Kaggle output .zip (compact or full) into --data-dir and hydrate locally")
     ap.add_argument("--watch-dir", default=None,
@@ -65,12 +71,10 @@ def main() -> int:
 
             backend = MockBackend(args.data_dir if args.data_dir != "corpus_data" else "mock_workspace")
         else:
-            from sautlab.backend.remote_kaggle import RemoteKaggleBackend
             from sautlab.kaggle_bridge import (
                 auto_import_latest_zip,
                 default_downloads_dirs,
                 record_auto_import,
-                resolve_live_kaggle_url,
                 unpack_corpus_archive,
             )
 
@@ -83,42 +87,78 @@ def main() -> int:
                 if zp is not None:
                     print(f"[SautLab] Auto-imported {zp.name} -> {len(vids)} video(s): {', '.join(vids)}")
 
-            kaggle_url = args.kaggle_url
-            if not kaggle_url and not args.no_auto_beacon:
-                live_url, health = resolve_live_kaggle_url(slug=args.endpoint_slug, timeout_s=4.0)
-                if live_url:
-                    kaggle_url = live_url
-                    dev = (health or {}).get("device", "Kaggle")
-                    print(f"[SautLab] Auto-connected to Kaggle GPU beacon: {live_url} ({dev})")
+            if args.local:
+                from sautlab.backend.corpus import CorpusBackend
 
-            def backend_factory(folder: str | Path) -> RemoteKaggleBackend:
-                cur_url = getattr(backend, "remote_url", kaggle_url)
-                cur_fallback = getattr(backend, "allow_local_fallback", args.local)
-                return RemoteKaggleBackend(
-                    folder,
-                    remote_url=cur_url,
+                def backend_factory(folder: str | Path) -> CorpusBackend:
+                    return CorpusBackend(
+                        folder,
+                        classifier=args.classifier,
+                        vad=args.vad,
+                        snr_threshold=args.snr_threshold,
+                        cookies_file=args.cookies,
+                        device=args.device,
+                    )
+
+                backend = backend_factory(args.data_dir)
+            elif args.kaggle_url:
+                from sautlab.backend.remote_kaggle import RemoteKaggleBackend
+
+                def backend_factory(folder: str | Path) -> RemoteKaggleBackend:
+                    cur_url = getattr(backend, "remote_url", args.kaggle_url)
+                    return RemoteKaggleBackend(
+                        folder,
+                        remote_url=cur_url,
+                        auto_beacon=not args.no_auto_beacon,
+                        endpoint_slug=args.endpoint_slug,
+                        allow_local_fallback=False,
+                        classifier=args.classifier,
+                        vad=args.vad,
+                        snr_threshold=args.snr_threshold,
+                        cookies_file=args.cookies,
+                        device=args.device,
+                    )
+
+                backend = RemoteKaggleBackend(
+                    args.data_dir,
+                    remote_url=args.kaggle_url,
                     auto_beacon=not args.no_auto_beacon,
                     endpoint_slug=args.endpoint_slug,
-                    allow_local_fallback=cur_fallback,
+                    allow_local_fallback=False,
                     classifier=args.classifier,
                     vad=args.vad,
                     snr_threshold=args.snr_threshold,
                     cookies_file=args.cookies,
                     device=args.device,
                 )
+            else:
+                from sautlab.backend.kaggle_cli import KaggleCliBackend
 
-            backend = RemoteKaggleBackend(
-                args.data_dir,
-                remote_url=kaggle_url,
-                auto_beacon=not args.no_auto_beacon,
-                endpoint_slug=args.endpoint_slug,
-                allow_local_fallback=args.local,
-                classifier=args.classifier,
-                vad=args.vad,
-                snr_threshold=args.snr_threshold,
-                cookies_file=args.cookies,
-                device=args.device,
-            )
+                def backend_factory(folder: str | Path) -> KaggleCliBackend:
+                    cur_ds = getattr(backend, "dataset_name", args.dataset)
+                    return KaggleCliBackend(
+                        folder,
+                        dataset_name=cur_ds,
+                        kernel_slug=args.kernel,
+                        cookies_dataset=args.cookies_dataset,
+                        classifier=args.classifier,
+                        vad=args.vad,
+                        snr_threshold=args.snr_threshold,
+                        cookies_file=args.cookies,
+                        device=args.device,
+                    )
+
+                backend = KaggleCliBackend(
+                    args.data_dir,
+                    dataset_name=args.dataset,
+                    kernel_slug=args.kernel,
+                    cookies_dataset=args.cookies_dataset,
+                    classifier=args.classifier,
+                    vad=args.vad,
+                    snr_threshold=args.snr_threshold,
+                    cookies_file=args.cookies,
+                    device=args.device,
+                )
     except ImportError as e:
         QMessageBox.critical(None, "SautLab", f"{e}\n\nInstall the requirements with:\n  pip install -r requirements-gui.txt\n\nOr start with --mock to try the GUI with fake data.")
         return 1

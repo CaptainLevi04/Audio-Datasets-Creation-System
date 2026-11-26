@@ -87,6 +87,8 @@ class MainWindow(QMainWindow):
 
         # panels
         self.source = VideoSourceCard()
+        if hasattr(backend, "set_dataset_name"):
+            self.source.set_dataset_controls(True, getattr(backend, "dataset_name", "sautlab-corpus"))
         self.info = VideoInfoCard()
         self.extract = AudioExtractionCard()
         self.videos = ProjectVideosCard()
@@ -137,7 +139,10 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._wire()
         QApplication.instance().aboutToQuit.connect(self._stop_workers)
-        QTimer.singleShot(0, self._startup)
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.timeout.connect(self._startup)
+        self._startup_timer.start(0)
 
     # top bar
     def _build_topbar(self) -> QWidget:
@@ -249,6 +254,8 @@ class MainWindow(QMainWindow):
         m["Processing"].menu().addAction(self.a_run)
         if hasattr(self.backend, "pull_remote_videos"):
             m["Processing"].menu().addAction(self._act("Pull finished videos from Kaggle...", self._pull_from_kaggle, None, "download"))
+        if hasattr(self.backend, "shutdown_session"):
+            m["Processing"].menu().addAction(self._act("Stop Kaggle GPU Session", self._stop_kaggle_session))
         self.a_rerun = self._act("Recompute SNR for selected segment", self._reprocess_selected, None, "refresh")
         a_asr = self._act("Import ASR results (Kaggle segments.csv)...", self._import_asr, None, "file-export-outline")
         m["Processing"].menu().addActions([self.a_rerun, a_asr])
@@ -424,19 +431,41 @@ class MainWindow(QMainWindow):
 
     # download and extraction
     def _download(self, url: str) -> None:
+        if hasattr(self.backend, "set_dataset_name"):
+            slug = self.backend.set_dataset_name(self.source.dataset.text())
+            self.source.dataset.setText(slug)
+            self.c.log_info(f"Submitting Kaggle CLI run -> dataset: {slug}", kind="info")
+        self._last_dl_stage = ""
         self.source.set_busy(True, 0.0, "Starting download...")
         w = Worker(lambda prog: self.backend.download(url, prog))
-        w.progress.connect(lambda f, m: self.source.set_busy(True, f, m))
+        w.progress.connect(self._download_progress)
         w.done.connect(self._downloaded)
         w.failed.connect(lambda msg: self._error("Download failed", msg))
         self._run_worker(w)
+
+    def _download_progress(self, f: float, m: str) -> None:
+        self.source.set_busy(True, f, m)
+        stage = m.split("(")[0].strip() if m else ""
+        if stage and stage != getattr(self, "_last_dl_stage", ""):
+            self._last_dl_stage = stage
+            self.c.log_info(m, kind="info")
 
     def _downloaded(self, v) -> None:
         self.source.set_busy(False, text="Download complete")
         self.source.url.clear()
         self.c.refresh_videos()
-        self.c.log_info(f"Downloaded: {v.title}")
+        self._refresh_videos()
+        self.c.log_info(f"Ready: {v.title}", kind="ok")
         self._extract(v.id, 16000, 1, then_select=True)
+
+    def _stop_kaggle_session(self) -> None:
+        if not hasattr(self.backend, "shutdown_session"):
+            return
+        self.c.log_info("Sending shutdown signal to Kaggle session...", kind="info")
+        w = Worker(lambda _prog: self.backend.shutdown_session())
+        w.done.connect(lambda _r: self.c.log_info("Kaggle shutdown signal sent.", kind="ok"))
+        w.failed.connect(self._worker_failed("Could not stop Kaggle session"))
+        self._run_worker(w)
 
     def _add_local_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -852,8 +881,12 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 ev.ignore()
                 return
+        if getattr(self, "_startup_timer", None) is not None:
+            self._startup_timer.stop()
         if self._download_timer is not None:
             self._download_timer.stop()
+        if hasattr(self.backend, "shutdown_session"):
+            self.backend.shutdown_session()
         if self.c.dirty:
             self.c.save()
         self.player.pause()
