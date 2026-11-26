@@ -1,26 +1,87 @@
-# Kaggle Notebook Setup & Quickstart Guide
+# Audio Datasets Creation System (SautLab)
 
-YouTube blocks direct downloads from Kaggle server IPs, so complete this **one-time setup** before running the notebook:
-
----
-
-### 1. Export `cookies.txt` from Your Browser
-1. Open **Chrome** or **Edge** in an **Incognito** window (prevents the session from expiring when closing your main browser). *(Optional -> you can open it in normal mode and not incognito)*
-2. Go to [YouTube](https://www.youtube.com) and **Sign in** *(a secondary Google account is recommended for safety)*.
-3. Open any video and play it for a second (forces YouTube to set active session cookies).
-4. Install the **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)** extension *(enable **Allow in Incognito** in your browser's extension settings)*.
-5. While on the YouTube tab, click the extension icon -> select **Current Site** -> click **Export** to download `cookies.txt`.
-6. Close the Incognito window using the `X` button **without signing out**.
+Local Arabic speech-dataset builder and desktop annotation GUI (`PySide6`). Downloads audio, classifies regions (`speech` / `mixed` / `music` / `silence`), segments at pauses with 3-detector voting (`Energy + Silero + Whisper`), estimates SNR, runs sequential Dual ASR (`NVIDIA Arabic Conformer` + quantized `Audar-ASR-V1-Turbo` tuned for `>= 4 GB VRAM` GPUs), and exports reviewed transcripts/audio.
 
 ---
 
-### 2. Upload Cookies to Kaggle as a Private Dataset
-1. Open the notebook on Kaggle, go to the right sidebar, and click **Upload** -> **New Dataset**.
+## 1. Requirements
+
+- **Python 3.10–3.12** (tested on **Python 3.11**)
+- **FFmpeg** installed and available on `PATH` (`ffmpeg -version`)
+- **NVIDIA GPU (`>= 4 GB VRAM`, CUDA)** recommended for fast local ASR *(CPU and `--mock` mode work without a GPU)*
 
 ---
 
-### 3. Configure Notebook Settings & Run
-1. In the right sidebar (**Session options**):
-   - Toggle **Internet** **ON** (required for `yt-dlp` to download the audio).
-   - Select **Accelerator: GPU T4 x2** to run the transcription model.
-2. Run
+## 2. Install
+
+```bash
+git clone https://github.com/CaptainLevi04/Audio-Datasets-Creation-System.git
+cd Audio-Datasets-Creation-System
+
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+
+pip install -r requirements-gui.txt faster-whisper
+```
+
+> **GPU note:** If `pip` installs CPU-only `torch`, install CUDA PyTorch from [pytorch.org](https://pytorch.org/get-started/locally/) first, then re-run the `pip install` command above.
+
+---
+
+## 3. Run the Desktop GUI
+
+```bash
+python run_gui.py
+```
+
+### Quick Workflow in the GUI
+1. Paste a YouTube link -> click **Download** *(or add a local audio/video file from the **Video** menu)*.
+2. Click **Extract** (prepares 16 kHz mono WAV).
+3. Click **Run Pipeline** (region classification -> 3-detector segmentation -> SNR -> Dual ASR).
+   - *First run automatically downloads the local models and `llama.cpp` server into `~/.cache/`.*
+4. Review/edit segments and transcripts, then click **Export CSV** *(or **Export** menu -> CSV / `.wav` + `.txt`)*.
+
+### Try Without Downloads or GPU
+
+```bash
+python run_gui.py --mock
+```
+
+---
+
+## 4. Useful Options (`run_gui.py`)
+
+| Flag | Purpose |
+|---|---|
+| `--mock` | Launch with offline demo data (no downloads or GPU needed) |
+| `--data-dir PATH` | Folder to store processed videos (default: `corpus_data`) |
+| `--snr-threshold 20` | Clean/Noisy dB threshold (default: `25.0`; use `20` for YouTube/podcasts) |
+| `--cookies cookies.txt` | Pass YouTube browser cookies if downloads are blocked |
+| `--no-asr` | Run Steps 3–5 only (skip Dual ASR) |
+| `--no-word-verification` | Use 2-detector segmentation (`Energy + Silero`) instead of 3-detector (`Whisper`) |
+| `--device cpu` / `cuda` | Force CPU or GPU for PyTorch/NeMo models |
+
+---
+
+## 5. Optional: CLI Pipeline Only (Steps 1–4)
+
+```bash
+python run_pipeline.py --demo
+python run_pipeline.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --out-dir corpus_data
+python run_pipeline.py --file "path/to/video.mp4" --out-dir corpus_data
+```
+
+---
+
+## 6. Troubleshooting
+
+- **Model download stalls on Windows (`Hugging Face`):**
+  ```powershell
+  $env:HF_HUB_DISABLE_XET="1"
+  python run_gui.py
+  ```
+- **YouTube blocks download:** Export cookies from Chrome/Edge using a `cookies.txt` browser extension while signed in to YouTube, then run:
+  ```bash
+  python run_gui.py --cookies path/to/cookies.txt
+  ```
