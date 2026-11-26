@@ -533,6 +533,41 @@ class CorpusBackend(Backend):
         self._update_state(vdir, exported_at=time.strftime("%Y-%m-%d %H:%M:%S"))
         self._refresh(vdir)
 
+    def clear_processing(self, video_id: str) -> VideoInfo:
+        """Delete cached Steps 3-6 & review outputs for `video_id`, keeping downloaded audio/metadata."""
+        vdir = self._dir(video_id)
+        for name in (
+            "regions.csv",
+            "regions.meta.json",
+            "windows_ast.csv",
+            "segments_student1.csv",
+            "segments_snr.csv",
+            "segments_asr.csv",
+            "segments_full.csv",
+            "segments.csv",
+            "segments_staging.csv",
+            "snr_diagnostics.csv",
+            "review_queue_urgent.csv",
+            "ablation_metrics.json",
+            "transition_requests.json",
+            "unselected_review_candidates.json",
+            "voting_grid.csv",
+            "word_timestamps.json",
+            "asr_conformer_ckpt.csv",
+            "asr_audar_ckpt.csv",
+            "qc_report.md",
+            "gui_state.json",
+            "changes.csv",
+        ):
+            (vdir / name).unlink(missing_ok=True)
+        for png in vdir.glob("*.png"):
+            png.unlink(missing_ok=True)
+        for sub in ("segments", "segments_staging", "_segments_old", "transcripts"):
+            shutil.rmtree(vdir / sub, ignore_errors=True)
+        self._flags_cache.clear()
+        self._persisted.pop(video_id, None)
+        return self._refresh(vdir)
+
     # pipeline
     def _classifier_kind(self) -> str:
         if self.classifier == "heuristic":

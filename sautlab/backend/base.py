@@ -77,3 +77,7 @@ class Backend(ABC):
 
     def mark_exported(self, video_id: str) -> None:
         """Called after the annotator exported the final CSV."""
+
+    def clear_processing(self, video_id: str) -> VideoInfo | None:
+        """Optional: delete cached Steps 3-6 processing outputs while keeping the downloaded video/audio."""
+        raise NotImplementedError("This backend cannot clear processing caches.")

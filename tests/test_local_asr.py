@@ -201,7 +201,24 @@ class LocalDualAsrTests(unittest.TestCase):
                 app.processEvents()
                 self.assertEqual(win.c.asr_names, ("Conformer", "Audar"))
                 self.assertFalse(hasattr(win.source, "dataset"))
+                from PySide6.QtGui import QAction
+
+                settings_actions = [a.text() for a in win.findChildren(QAction)]
+                self.assertIn("Clear processing for current video...", settings_actions)
                 win.close()
+
+                # Clearing processing keeps downloaded audio/info.json and resets Steps 3-6 to pending
+                cleared = backend.clear_processing(vi.id)
+                self.assertTrue((vdir / "audio.wav").is_file())
+                self.assertTrue((vdir / "info.json").is_file())
+                self.assertFalse((vdir / "regions.csv").exists())
+                self.assertFalse((vdir / "segments.csv").exists())
+                self.assertFalse((vdir / "segments").exists())
+                self.assertFalse((vdir / "transcripts").exists())
+                self.assertEqual(cleared.steps["download"]["state"], "done")
+                self.assertEqual(cleared.steps["extract"]["state"], "done")
+                for st in ("region_labels", "segmentation", "snr", "dual_asr"):
+                    self.assertEqual(cleared.steps[st]["state"], "pending")
         finally:
             srv.shutdown()
             srv.server_close()

@@ -293,6 +293,8 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _=False, s=sec: setattr(self.inspector, "context_sec", s))
             grp.addAction(a)
             ctx.addAction(a)
+        sm.addSeparator()
+        sm.addAction(self._act("Clear processing for current video...", self._clear_processing))
 
         QShortcut(QKeySequence(Qt.Key_Space), self, activated=self.player.toggle)
 
@@ -640,6 +642,32 @@ class MainWindow(QMainWindow):
         if ok:
             n = self.c.apply_snr_threshold(val)
             QMessageBox.information(self, "SNR threshold", f"{n} segment(s) changed their automatic clean/noisy value.")
+
+    def _clear_processing(self) -> None:
+        if not self.c.video:
+            QMessageBox.information(self, "Clear processing", "Select a video first.")
+            return
+        if self._pipeline_busy:
+            QMessageBox.warning(self, "Clear processing", "Wait until the running pipeline finishes first.")
+            return
+        vid = self.c.video.id
+        ans = QMessageBox.question(
+            self,
+            "Clear processing",
+            f"Clear all processing results (regions, segments, SNR, ASR, edits) for:\n{self.c.video.title}\n\n"
+            "The downloaded video/audio will be kept so you can run the pipeline fresh.",
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            self.backend.clear_processing(vid)
+        except NotImplementedError as e:
+            QMessageBox.information(self, "Clear processing", str(e))
+            return
+        self.c.dirty = False
+        self.c.refresh_videos()
+        self.c.load_video(vid)
+        self.c.log_info(f"Cleared processing for {vid}; ready for a fresh Run Pipeline.", kind="info")
 
     def _show_help(self) -> None:
         QMessageBox.information(
