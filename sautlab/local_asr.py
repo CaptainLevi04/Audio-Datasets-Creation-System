@@ -163,17 +163,35 @@ def ensure_audar_gguf(
     mmproj_file: str = DEFAULT_AUDAR_MMPROJ,
 ) -> tuple[Path, Path]:
     """Download/resolve quantized Audar GGUF decoder + BF16 audio mmproj via Hugging Face cache."""
+    # Avoid hf-xet CAS stalls on Windows; standard HTTPS CDN supports full speed & disk resume.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    import huggingface_hub.constants as _hf_const
     from huggingface_hub import hf_hub_download
+
+    _hf_const.HF_HUB_DISABLE_XET = True
 
     model_path = Path(gguf_file)
     if not model_path.is_file():
-        model_path = Path(hf_hub_download(repo_id=repo_id, filename=gguf_file))
+        model_path = Path(_hf_download_with_resume(hf_hub_download, repo_id, gguf_file))
 
     mm_path = Path(mmproj_file)
     if not mm_path.is_file():
-        mm_path = Path(hf_hub_download(repo_id=repo_id, filename=mmproj_file))
+        mm_path = Path(_hf_download_with_resume(hf_hub_download, repo_id, mmproj_file))
 
     return model_path, mm_path
+
+
+def _hf_download_with_resume(download_fn, repo_id: str, filename: str, max_attempts: int = 8) -> str:
+    """Retry `hf_hub_download` across transient network/DNS timeouts while resuming `.incomplete`."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return download_fn(repo_id=repo_id, filename=filename)
+        except Exception as exc:
+            if attempt >= max_attempts:
+                raise
+            print(f"Download paused ({type(exc).__name__}), retrying in 5s [{attempt}/{max_attempts}]...", flush=True)
+            time.sleep(5.0)
+    raise RuntimeError(f"Failed to download {repo_id}/{filename}")
 
 
 def _resolve_conformer_source(model_id: str) -> tuple[str, bool]:
