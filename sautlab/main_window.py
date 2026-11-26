@@ -57,10 +57,19 @@ class Worker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, backend: Backend, user: str = "Mohamed Ahmed", backend_factory=None):
+    def __init__(
+        self,
+        backend: Backend,
+        user: str = "Mohamed Ahmed",
+        backend_factory=None,
+        watch_downloads: list[str | Path] | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.backend_factory = backend_factory  # callable(data_dir) -> Backend, enables "Open data folder"
+        self._watch_dirs = [Path(p) for p in watch_downloads] if watch_downloads else []
+        self._auto_importing = False
+        self._download_timer: QTimer | None = None
         self.c = ProjectController(backend, user)
         self.player = Player()
         self._workers: set[Worker] = set()
@@ -350,6 +359,15 @@ class MainWindow(QMainWindow):
         self._refresh_videos()
         if self.c.videos:
             self._select_video(self.c.videos[0].id)
+        if self._watch_dirs and hasattr(self.backend, "import_kaggle_zip"):
+            self._download_timer = QTimer(self)
+            self._download_timer.setInterval(3000)
+            self._download_timer.timeout.connect(self._poll_downloads)
+            self._download_timer.start()
+            self.c.log_info(
+                f"Auto-watch active on: {', '.join(str(p) for p in self._watch_dirs)}",
+                kind="info",
+            )
 
     def _select_video(self, vid: str) -> None:
         if self.c.video and self.c.video.id == vid:
@@ -516,13 +534,55 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._start_zip_import(path, auto=False)
+
+    def _poll_downloads(self) -> None:
+        if self._auto_importing or self._pipeline_busy or not hasattr(self.backend, "import_kaggle_zip"):
+            return
+        data_root = getattr(self.backend, "root", None)
+        if data_root is None:
+            return
+        from .kaggle_bridge import find_latest_kaggle_zip, should_auto_import
+
+        cand = find_latest_kaggle_zip(search_dirs=self._watch_dirs)
+        if cand is not None and should_auto_import(cand, data_root):
+            self._start_zip_import(cand, auto=True)
+
+    def _start_zip_import(self, path: str | Path, auto: bool = False) -> None:
+        if self._auto_importing:
+            return
+        zp = Path(path)
         if self.c.dirty:
             self.c.save()
-        self.c.log_info(f"Importing & hydrating {Path(path).name} ...", kind="info")
-        w = Worker(lambda _prog: self.backend.import_kaggle_zip(path))
-        w.done.connect(lambda vids: self._kaggle_imported(vids, source="Kaggle archive"))
-        w.failed.connect(self._worker_failed("Could not import Kaggle archive"))
+        self._auto_importing = True
+        prefix = "Auto-detected Kaggle archive in Downloads" if auto else "Importing & hydrating"
+        self.c.log_info(f"{prefix}: {zp.name} ...", kind="info")
+
+        def _do(_prog):
+            vids = self.backend.import_kaggle_zip(zp)
+            data_root = getattr(self.backend, "root", None)
+            if data_root is not None:
+                from .kaggle_bridge import record_auto_import
+
+                record_auto_import(zp, data_root, vids)
+            return vids
+
+        w = Worker(_do)
+        w.done.connect(lambda vids: self._zip_import_finished(vids, zp.name, auto))
+        w.failed.connect(lambda msg: self._zip_import_failed(msg, auto))
         self._run_worker(w)
+
+    def _zip_import_finished(self, vids: list[str], name: str, auto: bool) -> None:
+        self._auto_importing = False
+        src = f"Downloads ({name})" if auto else f"Kaggle archive ({name})"
+        self._kaggle_imported(vids, source=src)
+
+    def _zip_import_failed(self, msg: str, auto: bool) -> None:
+        self._auto_importing = False
+        if auto:
+            self.c.log_info(f"Auto-import waiting ({msg})", kind="warn")
+        else:
+            self._error("Could not import Kaggle archive", msg)
 
     def _pull_from_kaggle(self) -> None:
         if not hasattr(self.backend, "pull_remote_videos"):
@@ -755,6 +815,8 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 ev.ignore()
                 return
+        if self._download_timer is not None:
+            self._download_timer.stop()
         if self.c.dirty:
             self.c.save()
         self.player.pause()

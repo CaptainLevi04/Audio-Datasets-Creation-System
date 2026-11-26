@@ -31,6 +31,12 @@ def main() -> int:
                     help="remote Kaggle GPU server URL from main-runner.ipynb (or set SAUTLAB_KAGGLE_URL)")
     ap.add_argument("--import-zip", default=None,
                     help="unpack a Kaggle output .zip (compact or full) into --data-dir and hydrate locally")
+    ap.add_argument("--watch-dir", default=None,
+                    help="folder to watch for corpus_final_output*.zip (default: ~/Downloads and current dir)")
+    ap.add_argument("--no-auto-import", action="store_true",
+                    help="do not auto-import the latest Kaggle output zip from Downloads on startup")
+    ap.add_argument("--no-watch", action="store_true",
+                    help="do not watch Downloads for new Kaggle output zips while the GUI is open")
     ap.add_argument("--mock", action="store_true", help="use fake data instead of the real backend")
     args = ap.parse_args()
 
@@ -46,6 +52,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     backend_factory = None
+    watch_dirs = None
     try:
         if args.mock:
             from sautlab.backend.mock import MockBackend
@@ -53,10 +60,21 @@ def main() -> int:
             backend = MockBackend(args.data_dir if args.data_dir != "corpus_data" else "mock_workspace")
         else:
             from sautlab.backend.remote_kaggle import RemoteKaggleBackend
-            from sautlab.kaggle_bridge import unpack_corpus_archive
+            from sautlab.kaggle_bridge import (
+                auto_import_latest_zip,
+                default_downloads_dirs,
+                record_auto_import,
+                unpack_corpus_archive,
+            )
 
+            watch_dirs = [Path(args.watch_dir)] if args.watch_dir else default_downloads_dirs()
             if args.import_zip:
-                unpack_corpus_archive(args.import_zip, args.data_dir, hydrate=True)
+                vids = unpack_corpus_archive(args.import_zip, args.data_dir, hydrate=True)
+                record_auto_import(args.import_zip, args.data_dir, vids)
+            elif not args.no_auto_import:
+                zp, vids = auto_import_latest_zip(args.data_dir, search_dirs=watch_dirs)
+                if zp is not None:
+                    print(f"[SautLab] Auto-imported {zp.name} -> {len(vids)} video(s): {', '.join(vids)}")
 
             kaggle_url = args.kaggle_url
 
@@ -84,7 +102,12 @@ def main() -> int:
     except ImportError as e:
         QMessageBox.critical(None, "SautLab", f"{e}\n\nInstall the requirements with:\n  pip install -r requirements-gui.txt\n\nOr start with --mock to try the GUI with fake data.")
         return 1
-    win = MainWindow(backend, user, backend_factory=backend_factory)
+    win = MainWindow(
+        backend,
+        user,
+        backend_factory=backend_factory,
+        watch_downloads=None if (args.mock or args.no_watch) else watch_dirs,
+    )
     win.show()
     return app.exec()
 

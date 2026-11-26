@@ -37,6 +37,7 @@ from .kaggle_bridge import (
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _CF_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com")
+_LHR_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.(?:lhr\.life|localhost\.run)")
 _CF_BIN_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 ProgressCb = Callable[[float, str], None]
@@ -675,11 +676,59 @@ def _ensure_cloudflared() -> str:
     return str(local_bin)
 
 
-def start_cloudflare_tunnel(port: int, timeout_s: float = 45.0) -> tuple[subprocess.Popen, str]:
+def start_cloudflare_tunnel(port: int, timeout_s: float = 20.0) -> tuple[subprocess.Popen, str]:
     """Launch a Cloudflare quick tunnel pointing at `http://127.0.0.1:{port}`."""
     bin_path = _ensure_cloudflared()
     proc = subprocess.Popen(
         [bin_path, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    url: str | None = None
+    rate_limited = False
+    lines: list[str] = []
+    ev = threading.Event()
+
+    def _reader() -> None:
+        nonlocal url, rate_limited
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line)
+            m = _CF_URL_RE.search(line)
+            if m and url is None:
+                url = m.group(0)
+                ev.set()
+            elif "status 429" in line or "Tunnelstore request failed" in line:
+                rate_limited = True
+                ev.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+    ev.wait(timeout=timeout_s)
+    if not url:
+        proc.terminate()
+        tail = "".join(lines[-20:])
+        reason = "Cloudflare quick tunnel returned 429 rate-limit on this IP" if rate_limited else f"cloudflared tunnel did not publish a URL within {timeout_s}s"
+        raise RuntimeError(f"{reason}.\n{tail}")
+    return proc, url
+
+
+def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.Popen, str]:
+    """Launch an SSH HTTPS tunnel via localhost.run (no API account or token needed)."""
+    ssh_bin = shutil.which("ssh")
+    if not ssh_bin:
+        raise RuntimeError("`ssh` binary is not available for localhost.run fallback.")
+    proc = subprocess.Popen(
+        [
+            ssh_bin,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ServerAliveInterval=30",
+            "-R", f"80:127.0.0.1:{port}",
+            "nokey@localhost.run",
+        ],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -694,7 +743,7 @@ def start_cloudflare_tunnel(port: int, timeout_s: float = 45.0) -> tuple[subproc
         assert proc.stdout is not None
         for line in proc.stdout:
             lines.append(line)
-            m = _CF_URL_RE.search(line)
+            m = _LHR_URL_RE.search(line)
             if m and url is None:
                 url = m.group(0)
                 ev.set()
@@ -703,14 +752,14 @@ def start_cloudflare_tunnel(port: int, timeout_s: float = 45.0) -> tuple[subproc
     if not ev.wait(timeout=timeout_s) or not url:
         proc.terminate()
         tail = "".join(lines[-20:])
-        raise RuntimeError(f"cloudflared tunnel did not publish a URL within {timeout_s}s.\n{tail}")
+        raise RuntimeError(f"localhost.run tunnel did not publish a URL within {timeout_s}s.\n{tail}")
     return proc, url
 
 
 def start_remote_server(
     data_dir: str | Path = "corpus_data",
     port: int = 8765,
-    tunnel: str | None = "cloudflared",
+    tunnel: str | None = "auto",
     cookies_source: str | Path | None = None,
     work_root: str | Path | None = None,
     block: bool = True,
@@ -729,8 +778,21 @@ def start_remote_server(
 
     tunnel_proc = None
     public_url = f"http://127.0.0.1:{actual_port}"
-    if tunnel == "cloudflared":
-        tunnel_proc, public_url = start_cloudflare_tunnel(actual_port)
+    try:
+        if tunnel in {"auto", "cloudflared"}:
+            try:
+                tunnel_proc, public_url = start_cloudflare_tunnel(actual_port)
+            except Exception as cf_err:
+                if tunnel == "auto" or "429" in str(cf_err):
+                    print(f"⚠️  Cloudflare tunnel unavailable ({str(cf_err).splitlines()[0]}); trying localhost.run SSH tunnel...")
+                    tunnel_proc, public_url = start_localhost_run_tunnel(actual_port)
+                else:
+                    raise
+        elif tunnel == "localhost.run":
+            tunnel_proc, public_url = start_localhost_run_tunnel(actual_port)
+    except Exception:
+        _stop_server(server, mgr, tunnel_proc)
+        raise
 
     health = mgr.health_info()
     print("=" * 72)

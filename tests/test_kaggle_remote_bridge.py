@@ -22,14 +22,18 @@ from sautlab.backend.corpus import CorpusBackend
 from sautlab.backend.remote_kaggle import RemoteKaggleBackend
 from sautlab.kaggle_bridge import (
     SR,
+    auto_import_latest_zip,
     build_corpus_archive,
     ensure_conditioned_flac,
+    find_latest_kaggle_zip,
     hydrate_video_dir,
+    should_auto_import,
     unpack_corpus_archive,
 )
 from sautlab.remote_server import (
     RemoteJobManager,
     create_remote_http_server,
+    start_remote_server,
 )
 from speech_corpus.audio import read_wav, write_wav
 
@@ -297,6 +301,88 @@ class KaggleBridgeAndRemoteTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 mgr.shutdown()
+
+    def test_auto_downloads_discovery_watcher_and_tunnel_fallback(self) -> None:
+        import os
+        import time
+        from unittest.mock import MagicMock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            dl_dir = tmp_p / "Downloads"
+            dl_dir.mkdir()
+            kaggle_data = tmp_p / "kaggle_src"
+            vid = "vid_auto_001"
+            _populate_sample_video(kaggle_data / vid, vid=vid)
+
+            # Unrelated or incomplete files must be ignored
+            partial = dl_dir / "corpus_final_output.zip.crdownload"
+            partial.write_bytes(b"partial")
+            with zipfile.ZipFile(dl_dir / "corpus_unrelated.zip", "w") as zf:
+                zf.writestr("readme.txt", "ignore me")
+            self.assertIsNone(find_latest_kaggle_zip(search_dirs=[dl_dir]))
+
+            z1 = dl_dir / "corpus_final_output.zip"
+            build_corpus_archive(kaggle_data, z1, mode="compact")
+            # Active Chrome .crdownload companion must defer pickup
+            companion = dl_dir / "corpus_final_output.zip.crdownload"
+            companion.write_bytes(b"still downloading")
+            self.assertIsNone(find_latest_kaggle_zip(search_dirs=[dl_dir]))
+            companion.unlink()
+
+            local_data = tmp_p / "local_gui_data"
+            picked, vids = auto_import_latest_zip(local_data, search_dirs=[dl_dir])
+            self.assertEqual(picked, z1.resolve())
+            self.assertEqual(vids, [vid])
+            self.assertTrue((local_data / vid / "audio.wav").exists())
+            self.assertFalse(should_auto_import(z1, local_data))
+
+            # Second auto-import call skips already-imported archive
+            picked2, vids2 = auto_import_latest_zip(local_data, search_dirs=[dl_dir])
+            self.assertIsNone(picked2)
+            self.assertEqual(vids2, [])
+
+            # Newer archive `corpus_final_output (1).zip` should be picked up by MainWindow live watcher
+            vid2 = "vid_auto_002"
+            _populate_sample_video(kaggle_data / vid2, vid=vid2)
+            time.sleep(0.05)
+            z2 = dl_dir / "corpus_final_output (1).zip"
+            build_corpus_archive(kaggle_data, z2, mode="compact", video_ids=[vid2])
+
+            os.environ["QT_QPA_PLATFORM"] = "offscreen"
+            from PySide6.QtCore import QEventLoop, QTimer
+            from PySide6.QtWidgets import QApplication
+            from sautlab.main_window import MainWindow
+
+            app = QApplication.instance() or QApplication([])
+            backend = RemoteKaggleBackend(local_data, classifier="heuristic", vad="energy")
+            win = MainWindow(backend, "Tester", watch_downloads=[dl_dir])
+            win._poll_downloads()
+
+            deadline = time.time() + 10.0
+            while not (local_data / vid2 / "segments" / "segment_0001.wav").exists() and time.time() < deadline:
+                loop = QEventLoop()
+                QTimer.singleShot(50, loop.quit)
+                loop.exec()
+            win._stop_workers()
+            win.close()
+
+            self.assertTrue((local_data / vid2 / "segments" / "segment_0001.wav").exists())
+            self.assertFalse(should_auto_import(z2, local_data))
+
+        # Tunnel auto-fallback when cloudflared fails with 429
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        with (
+            patch("sautlab.remote_server.start_cloudflare_tunnel", side_effect=RuntimeError("Cloudflare quick tunnel returned 429 rate-limit")),
+            patch("sautlab.remote_server.start_localhost_run_tunnel", return_value=(fake_proc, "https://abc123.lhr.life")) as lhr_mock,
+        ):
+            handle = start_remote_server(data_dir=Path(tempfile.mkdtemp()), port=0, tunnel="auto", block=False)
+            try:
+                self.assertEqual(handle["url"], "https://abc123.lhr.life")
+                lhr_mock.assert_called_once()
+            finally:
+                handle["stop"]()
 
 
 if __name__ == "__main__":

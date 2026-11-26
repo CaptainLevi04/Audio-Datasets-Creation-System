@@ -209,6 +209,181 @@ def unpack_corpus_archive(
 
 
 # ---------------------------------------------------------------------
+# 2b. Automated Downloads discovery, watcher markers & Kaggle UI export
+# ---------------------------------------------------------------------
+
+_TEMP_DL_SUFFIXES = (".crdownload", ".part", ".tmp", ".download")
+
+
+def default_downloads_dirs() -> list[Path]:
+    """Return existing local folders to check for downloaded Kaggle output zips."""
+    candidates = [Path.home() / "Downloads", Path.cwd()]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in candidates:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        key = str(rp).lower()
+        if rp.is_dir() and key not in seen:
+            seen.add(key)
+            out.append(rp)
+    return out
+
+
+def _is_valid_corpus_zip(path: Path) -> bool:
+    name_l = path.name.lower()
+    if any(name_l.endswith(sfx) or sfx in name_l for sfx in _TEMP_DL_SUFFIXES):
+        return False
+    for sfx in _TEMP_DL_SUFFIXES:
+        if path.with_name(path.name + sfx).exists():
+            return False
+    try:
+        if not path.is_file() or path.stat().st_size < 100:
+            return False
+        with zipfile.ZipFile(path, "r") as zf:
+            names = zf.namelist()
+        return any(
+            n.endswith(("segments.csv", "segments_asr.csv", "regions.csv", "info.json", "audio_conditioned.flac"))
+            for n in names
+        )
+    except Exception:
+        return False
+
+
+def find_latest_kaggle_zip(
+    search_dirs: list[str | Path] | None = None,
+    patterns: tuple[str, ...] = ("corpus_final_output*.zip", "corpus_*.zip"),
+) -> Path | None:
+    """Find the newest completed Kaggle corpus zip inside Downloads / working folders."""
+    dirs = [Path(d) for d in search_dirs] if search_dirs is not None else default_downloads_dirs()
+    found: list[tuple[int, Path]] = []
+    seen: set[str] = set()
+    for folder in dirs:
+        if not folder.is_dir():
+            continue
+        for pat in patterns:
+            for cand in folder.glob(pat):
+                key = str(cand.resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _is_valid_corpus_zip(cand):
+                    found.append((cand.stat().st_mtime_ns, cand.resolve()))
+    if not found:
+        return None
+    found.sort(key=lambda item: item[0], reverse=True)
+    return found[0][1]
+
+
+def _auto_import_marker(data_root: Path) -> Path:
+    return data_root / ".last_auto_import.json"
+
+
+def _zip_signature(zip_path: Path) -> dict:
+    st = zip_path.stat()
+    return {
+        "path": str(zip_path.resolve()),
+        "name": zip_path.name,
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def should_auto_import(zip_path: str | Path, target_data_root: str | Path) -> bool:
+    """True if `zip_path` is a valid completed archive not yet imported into `target_data_root`."""
+    zp = Path(zip_path)
+    if not _is_valid_corpus_zip(zp):
+        return False
+    target = Path(target_data_root)
+    marker = _auto_import_marker(target)
+    if not marker.is_file():
+        return True
+    try:
+        prev = json.loads(marker.read_text(encoding="utf-8"))
+        sig = _zip_signature(zp)
+        same_file = (
+            prev.get("name") == sig["name"]
+            and prev.get("size") == sig["size"]
+            and prev.get("mtime_ns") == sig["mtime_ns"]
+        )
+        if not same_file:
+            return True
+        prev_vids = prev.get("videos") or []
+        if prev_vids and all((target / vid).is_dir() for vid in prev_vids):
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def record_auto_import(zip_path: str | Path, target_data_root: str | Path, videos: list[str]) -> None:
+    """Persist metadata of the latest auto-imported zip so it isn't unpacked twice."""
+    zp = Path(zip_path)
+    target = Path(target_data_root)
+    target.mkdir(parents=True, exist_ok=True)
+    payload = _zip_signature(zp)
+    payload["videos"] = list(videos)
+    _auto_import_marker(target).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def auto_import_latest_zip(
+    target_data_root: str | Path,
+    search_dirs: list[str | Path] | None = None,
+) -> tuple[Path | None, list[str]]:
+    """Auto-find the newest un-imported Kaggle zip, extract + hydrate it, and return `(zip_path, videos)`."""
+    zp = find_latest_kaggle_zip(search_dirs=search_dirs)
+    if zp is None or not should_auto_import(zp, target_data_root):
+        return None, []
+    vids = unpack_corpus_archive(zp, target_data_root, hydrate=True)
+    record_auto_import(zp, target_data_root, vids)
+    return zp, vids
+
+
+def display_kaggle_zip_download(
+    zip_path: str | Path,
+    auto: bool = True,
+    max_auto_mb: float = 90.0,
+) -> None:
+    """Render an automatic browser download trigger + fallback button inside Jupyter/Kaggle."""
+    import base64
+    import uuid as _uuid
+
+    zp = Path(zip_path)
+    if not zp.is_file():
+        return
+    size_mb = zp.stat().st_size / (1024 * 1024)
+    try:
+        from IPython.display import FileLink, HTML, display
+    except Exception:
+        return
+
+    if size_mb <= max_auto_mb:
+        b64 = base64.b64encode(zp.read_bytes()).decode("ascii")
+        btn_id = f"dl_{_uuid.uuid4().hex[:8]}"
+        auto_js = f'setTimeout(function(){{ var el = document.getElementById("{btn_id}"); if (el) el.click(); }}, 400);' if auto else ""
+        html = f"""
+        <div style="padding:10px 14px;border:1px solid #2e7d32;border-radius:8px;background:#102514;color:#e8f5e9;font-family:sans-serif;margin:6px 0;">
+          <b>📦 {zp.name}</b> ({size_mb:.2f} MB) —
+          <a id="{btn_id}" download="{zp.name}" href="data:application/zip;base64,{b64}"
+             style="display:inline-block;padding:6px 14px;background:#2e7d32;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;margin-left:8px;">
+             ⬇️ Download to PC ({size_mb:.2f} MB)
+          </a>
+          <div style="font-size:12px;color:#a5d6a7;margin-top:6px;">
+            {"Triggering automatic browser download to your Downloads folder..." if auto else "Click the button to download."}
+            Local SautLab GUI (<code>python run_gui.py</code>) watches Downloads automatically.
+          </div>
+          <script>{auto_js}</script>
+        </div>
+        """
+        display(HTML(html))
+    else:
+        print(f"ℹ️ Archive is {size_mb:.1f} MB (> {max_auto_mb:.0f} MB inline auto-download cap). Use FileLink below or Kaggle Output pane:")
+        display(FileLink(str(zp)))
+
+
+# ---------------------------------------------------------------------
 # 3. Arabic Normalization, jiwer Comparison & Dual ASR Runner (Step 6)
 # ---------------------------------------------------------------------
 
