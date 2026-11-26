@@ -39,8 +39,8 @@ from .kaggle_bridge import (
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _CF_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com")
-_LHR_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.(?:lhr\.life|localhost\.run)")
-_PINGGY_URL_RE = re.compile(r"https://[A-Za-z0-9._-]+\.pinggy\.(?:link|io)")
+_LHR_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.(?:[A-Za-z0-9-]+\.)*lhr\.life")
+_PINGGY_URL_RE = re.compile(r"https://[A-Za-z0-9.-]+\.pinggy\.(?:link|io)")
 _CF_BIN_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 ProgressCb = Callable[[float, str], None]
@@ -777,6 +777,24 @@ def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subp
     )
 
 
+def _verify_public_health(url: str, timeout_s: float = 8.0) -> bool:
+    """Confirm the public tunnel actually forwards `/api/health` back to us."""
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(
+                f"{url.rstrip('/')}/api/health",
+                headers={"User-Agent": "SautLab-Client/1.0", "X-Pinggy-No-Screen": "true"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(data, dict) and data.get("status") == "ok":
+                    return True
+        except Exception:
+            time.sleep(0.75)
+    return False
+
+
 def start_pinggy_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.Popen, str]:
     """Launch an SSH HTTPS tunnel via pinggy.io on port 443 (no API account needed)."""
     ssh_bin = shutil.which("ssh")
@@ -793,7 +811,7 @@ def start_pinggy_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30",
             "-R0:127.0.0.1:{port}".format(port=port),
-            "a.pinggy.io",
+            "nokey@a.pinggy.io",
         ],
         _PINGGY_URL_RE,
         "pinggy.io",
@@ -833,10 +851,16 @@ def start_remote_server(
                 ("pinggy.io", start_pinggy_tunnel),
                 ("cloudflared", start_cloudflare_tunnel),
             ):
+                proc = None
                 try:
-                    tunnel_proc, public_url = fn(actual_port)
+                    proc, cand_url = fn(actual_port)
+                    if not _verify_public_health(cand_url):
+                        raise RuntimeError(f"{label} published {cand_url} but health check failed")
+                    tunnel_proc, public_url = proc, cand_url
                     break
                 except Exception as exc:
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
                     errors.append(f"{label}: {str(exc).splitlines()[0]}")
             else:
                 raise RuntimeError("All remote tunnel providers failed:\n  " + "\n  ".join(errors))

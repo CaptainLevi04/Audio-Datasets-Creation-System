@@ -33,6 +33,8 @@ def main() -> int:
                     help="private Kaggle dataset slug for Auto-Beacon discovery (default: sautlab-endpoint)")
     ap.add_argument("--no-auto-beacon", action="store_true",
                     help="disable automatic connection to private Kaggle Auto-Beacon")
+    ap.add_argument("--local", action="store_true",
+                    help="allow falling back to local CPU Steps 1-5 if Kaggle server is offline")
     ap.add_argument("--import-zip", default=None,
                     help="unpack a Kaggle output .zip (compact or full) into --data-dir and hydrate locally")
     ap.add_argument("--watch-dir", default=None,
@@ -91,11 +93,13 @@ def main() -> int:
 
             def backend_factory(folder: str | Path) -> RemoteKaggleBackend:
                 cur_url = getattr(backend, "remote_url", kaggle_url)
+                cur_fallback = getattr(backend, "allow_local_fallback", args.local)
                 return RemoteKaggleBackend(
                     folder,
                     remote_url=cur_url,
                     auto_beacon=not args.no_auto_beacon,
                     endpoint_slug=args.endpoint_slug,
+                    allow_local_fallback=cur_fallback,
                     classifier=args.classifier,
                     vad=args.vad,
                     snr_threshold=args.snr_threshold,
@@ -108,6 +112,7 @@ def main() -> int:
                 remote_url=kaggle_url,
                 auto_beacon=not args.no_auto_beacon,
                 endpoint_slug=args.endpoint_slug,
+                allow_local_fallback=args.local,
                 classifier=args.classifier,
                 vad=args.vad,
                 snr_threshold=args.snr_threshold,

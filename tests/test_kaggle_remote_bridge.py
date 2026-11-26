@@ -370,12 +370,37 @@ class KaggleBridgeAndRemoteTests(unittest.TestCase):
             self.assertTrue((local_data / vid2 / "segments" / "segment_0001.wav").exists())
             self.assertFalse(should_auto_import(z2, local_data))
 
-        # Tunnel auto-fallback chain (localhost.run -> pinggy -> cloudflared) + beacon publish
+        # Verify exact localhost.run banner ignores admin.localhost.run and matches multi-label .app.lhr.life
+        from sautlab.remote_server import _LHR_URL_RE
+
+        banner_sample = (
+            "To set up and manage custom domains go to https://admin.localhost.run/\n"
+            "https://localhost.run/docs/\n"
+            "2d7b3407fc3c33.app.lhr.life tunneled with tls termination, https://2d7b3407fc3c33.app.lhr.life\n"
+        )
+        m_lhr = _LHR_URL_RE.search(banner_sample)
+        self.assertIsNotNone(m_lhr)
+        self.assertEqual(m_lhr.group(0), "https://2d7b3407fc3c33.app.lhr.life")
+
+        # Verify allow_local_fallback=False refuses silent CPU fallback when Kaggle is offline
+        with tempfile.TemporaryDirectory() as tmp3:
+            strict_client = RemoteKaggleBackend(
+                Path(tmp3) / "pc",
+                remote_url=None,
+                auto_beacon=True,
+                allow_local_fallback=False,
+            )
+            with patch("sautlab.kaggle_bridge.fetch_kaggle_endpoint", return_value=None):
+                with self.assertRaises(RuntimeError):
+                    strict_client.download("https://www.youtube.com/watch?v=Xr2iW-qZ_II", lambda _f, _m="": None)
+
+        # Tunnel auto-fallback chain (localhost.run -> pinggy -> cloudflared) + health verify + beacon publish
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         with (
             patch("sautlab.remote_server.start_localhost_run_tunnel", side_effect=RuntimeError("lhr down")),
             patch("sautlab.remote_server.start_pinggy_tunnel", return_value=(fake_proc, "https://xyz.a.free.pinggy.link")) as png_mock,
+            patch("sautlab.remote_server._verify_public_health", return_value=True),
             patch("sautlab.remote_server.publish_kaggle_endpoint", return_value="amrgamal007/sautlab-endpoint") as pub_mock,
         ):
             handle = start_remote_server(data_dir=Path(tempfile.mkdtemp()), port=0, tunnel="auto", block=False)

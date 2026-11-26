@@ -37,6 +37,7 @@ class RemoteKaggleBackend(CorpusBackend):
         poll_interval: float = 1.5,
         auto_beacon: bool = False,
         endpoint_slug: str = "sautlab-endpoint",
+        allow_local_fallback: bool = True,
         **kwargs,
     ):
         super().__init__(data_dir=data_dir, **kwargs)
@@ -44,6 +45,7 @@ class RemoteKaggleBackend(CorpusBackend):
         self.poll_interval = float(poll_interval)
         self.auto_beacon = bool(auto_beacon)
         self.endpoint_slug = endpoint_slug
+        self.allow_local_fallback = bool(allow_local_fallback)
 
     @property
     def is_remote(self) -> bool:
@@ -57,11 +59,17 @@ class RemoteKaggleBackend(CorpusBackend):
             return health
         return None
 
-    def _ensure_remote(self) -> bool:
+    def _ensure_remote(self, action: str = "operation") -> bool:
         if self.remote_url:
             return True
-        if self.auto_beacon:
-            return self.connect_auto_beacon() is not None
+        if self.auto_beacon and self.connect_auto_beacon() is not None:
+            return True
+        if not self.allow_local_fallback:
+            raise RuntimeError(
+                f"Kaggle GPU server is not connected for {action}. "
+                "Make sure main-runner.ipynb Phase 4 (`SautLab Kaggle Remote GPU Server is LIVE`) "
+                "is running on Kaggle, then retry (or enable Settings -> Allow local CPU fallback)."
+            )
         return False
 
     def _url(self, route: str) -> str:
@@ -173,7 +181,7 @@ class RemoteKaggleBackend(CorpusBackend):
     # Overridden Backend API methods (route heavy steps to Kaggle GPU)
     # ------------------------------------------------------------------
     def download(self, url: str, progress: Progress) -> VideoInfo:
-        if not self._ensure_remote():
+        if not self._ensure_remote("YouTube download"):
             return super().download(url, progress)
 
         cookies_txt = None
@@ -193,7 +201,7 @@ class RemoteKaggleBackend(CorpusBackend):
     def extract_audio(self, video_id: str, sample_rate: int, channels: int, progress: Progress) -> str:
         vdir = self._dir(video_id)
         wav = vdir / "audio.wav"
-        if not self._ensure_remote() or wav.exists():
+        if wav.exists() or not self._ensure_remote("audio extraction"):
             return super().extract_audio(video_id, sample_rate, channels, progress)
 
         if sample_rate != 16000 or channels != 1:
@@ -211,7 +219,7 @@ class RemoteKaggleBackend(CorpusBackend):
         return str(wav)
 
     def run_pipeline(self, video_id: str, progress: Progress) -> list[Segment]:
-        if not self._ensure_remote():
+        if not self._ensure_remote("Steps 3-6 GPU pipeline"):
             return super().run_pipeline(video_id, progress)
 
         vdir = self._dir(video_id)

@@ -301,6 +301,13 @@ class MainWindow(QMainWindow):
         if hasattr(self.backend, "remote_url"):
             sm.addAction(self._act("Kaggle Remote Server URL...", self._set_kaggle_url))
             sm.addAction(self._act("Connect to Kaggle Auto-Beacon", self._connect_auto_beacon))
+            a_fb = self._act(
+                "Allow local CPU fallback if Kaggle offline",
+                lambda on: setattr(self.backend, "allow_local_fallback", bool(on)),
+                checkable=True,
+            )
+            a_fb.setChecked(bool(getattr(self.backend, "allow_local_fallback", True)))
+            sm.addAction(a_fb)
         ctx = sm.addMenu("Listen-around-cut context")
         grp = QActionGroup(self)
         for sec in (1.0, 1.5, 2.0, 3.0):
