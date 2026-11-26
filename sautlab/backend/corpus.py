@@ -90,7 +90,7 @@ class CorpusBackend(Backend):
         vad: str = "auto",  # auto | silero | energy
         snr_threshold: float = 25.0,
         snr_combine: str = "mean",
-        word_verification: bool = True,
+        word_verification: bool = False,
         cookies_file: str | None = None,
         device: str | None = None,
         run_asr: bool | None = None,
@@ -589,12 +589,7 @@ class CorpusBackend(Backend):
 
             # step 4: segmentation
             self._set_running(video_id, "segmentation", True)
-            seg_msg = (
-                "Cutting segments (3-detector voting + Whisper words)..."
-                if self.word_verification
-                else "Cutting segments at pauses..."
-            )
-            progress(0.25, seg_msg)
+            progress(0.25, "Cutting segments at pauses...")
             segments_df = sc.cut_speech_and_mixed_segments(
                 audio=audio, regions_df=regions_df, out_dir=vdir, sr=sr, pauses=pauses_df,
                 use_word_verification=self.word_verification, run_ablation=self.run_ablation,

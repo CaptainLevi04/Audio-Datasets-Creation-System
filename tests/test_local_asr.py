@@ -276,12 +276,12 @@ class LocalDualAsrTests(unittest.TestCase):
             self.assertIn("-np", captured_cmds[0])
             self.assertEqual(before_logs, after_logs)
 
-    def test_three_detector_whisper_word_verification_enabled_by_default(self) -> None:
+    def test_two_detector_energy_silero_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
             data_dir = tp / "corpus_data"
             default_backend = CorpusBackend(data_dir, run_asr=False)
-            self.assertTrue(default_backend.word_verification)
+            self.assertFalse(default_backend.word_verification)
 
             media = tp / "speech_ar.wav"
             y, _ = build_mock_audio(seed=11, timeline=[("silence", 1.5), ("speech", 18.0), ("silence", 1.5)])
@@ -290,30 +290,18 @@ class LocalDualAsrTests(unittest.TestCase):
             backend = CorpusBackend(data_dir, classifier="heuristic", vad="energy", run_asr=False)
             vi = backend.add_local_file(str(media), lambda _f, _m="": None)
             vdir = data_dir / vi.id
+            # Even if a stale word_timestamps.json sits on disk, 2-detector default ignores Whisper completely.
+            (vdir / "word_timestamps.json").write_text('[{"start": 2.0, "end": 4.0, "word": "تجربة"}]', encoding="utf-8")
 
-            fake_words = [
-                {"start": 2.0, "end": 4.5, "word": "مرحبا"},
-                {"start": 5.5, "end": 9.8, "word": "بكم"},
-                {"start": 10.6, "end": 18.5, "word": "اليوم"},
-            ]
-            with (
-                patch("speech_corpus.cut_engine_v2._load_word_model", return_value=object()) as load_mock,
-                patch("speech_corpus.cut_engine_v2.transcribe_words", return_value=fake_words) as tw_mock,
-            ):
+            with patch("speech_corpus.cut_engine_v2._load_word_model") as load_mock:
                 segs = backend.run_pipeline(vi.id, lambda _f, _m="": None)
             self.assertTrue(len(segs) >= 1)
-            load_mock.assert_called_once()
-            tw_mock.assert_called_once()
+            load_mock.assert_not_called()
 
             grid_df = pd.read_csv(vdir / "voting_grid.csv")
-            self.assertTrue((grid_df["num_detectors"] == 3).all())
-            self.assertTrue((grid_df["whisper_status"] == "AVAILABLE").all())
-            self.assertTrue((vdir / "word_timestamps.json").is_file())
-
-            # Second run reuses cached word_timestamps.json without reloading Whisper.
-            with patch("speech_corpus.cut_engine_v2._load_word_model") as load_cached_mock:
-                backend.run_pipeline(vi.id, lambda _f, _m="": None)
-            load_cached_mock.assert_not_called()
+            self.assertTrue((grid_df["num_detectors"] == 2).all())
+            self.assertTrue((grid_df["whisper_status"] == "UNAVAILABLE").all())
+            self.assertEqual(int(grid_df["whisper_vote"].sum()), 0)
 
     def test_ast_recitation_mapping_and_silence_guard(self) -> None:
         self.assertIn("chant", ast_model.SPEECH_NAMES)

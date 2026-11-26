@@ -840,7 +840,7 @@ def cut_four_label_segments(audio: np.ndarray,
                             out_dir: str | Path,
                             sr: int = DEFAULT_SR,
                             pauses: Optional[pd.DataFrame] = None,
-                            use_word_verification: bool = True,
+                            use_word_verification: bool = False,
                             word_model_size: str = "small",
                             run_ablation: bool = True,
                             **_ignored) -> pd.DataFrame:
@@ -893,12 +893,6 @@ def cut_four_label_segments(audio: np.ndarray,
                 gc.collect()
                 if torch is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
-    elif not use_word_verification and wt_path.exists():
-        try:
-            all_words = json.loads(wt_path.read_text(encoding="utf-8"))
-            print(f"🎙️ Loaded {len(all_words)} cached word tokens from word_timestamps.json.")
-        except Exception:
-            pass
 
     # Build candidates using unified voting grid
     if isinstance(pauses, (list, tuple)) and len(pauses) > 0 and isinstance(pauses[0], PauseCandidate):

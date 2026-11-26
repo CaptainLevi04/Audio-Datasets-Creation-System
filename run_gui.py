@@ -27,8 +27,6 @@ def main() -> int:
     ap.add_argument("--device", choices=["cuda", "cpu"], default=None, help="device for neural models (AST / Conformer)")
     ap.add_argument("--cookies", default=None, help="YouTube cookies.txt, if YouTube blocks the download")
     ap.add_argument("--no-asr", action="store_true", help="run Steps 3-5 only and skip local Dual ASR")
-    ap.add_argument("--no-word-verification", action="store_true",
-                    help="use 2-detector segmentation (Energy + Silero) instead of 3-detector with Whisper words")
     ap.add_argument("--conformer-model", default=None, help="Hugging Face ID or local .nemo path for NVIDIA Arabic Conformer")
     ap.add_argument("--audar-quant", default=None, help="Audar-ASR-V1-Turbo GGUF filename (default: Audar-ASR-V1-Turbo-Q4_K_M.gguf)")
     ap.add_argument("--mock", action="store_true", help="use fake data instead of the real backend")
@@ -53,10 +51,7 @@ def main() -> int:
         else:
             from sautlab.backend.corpus import CorpusBackend
 
-            extra_kw = {
-                "run_asr": not args.no_asr,
-                "word_verification": not args.no_word_verification,
-            }
+            extra_kw = {"run_asr": not args.no_asr}
             if args.conformer_model:
                 extra_kw["conformer_model"] = args.conformer_model
             if args.audar_quant:
