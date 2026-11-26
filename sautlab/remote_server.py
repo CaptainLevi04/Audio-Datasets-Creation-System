@@ -32,12 +32,15 @@ from .kaggle_bridge import (
     build_corpus_archive,
     ensure_conditioned_flac,
     hydrate_video_dir,
+    publish_kaggle_endpoint,
     run_dual_asr_on_video_dir,
 )
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _CF_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com")
 _LHR_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.(?:lhr\.life|localhost\.run)")
+_PINGGY_URL_RE = re.compile(r"https://[A-Za-z0-9._-]+\.pinggy\.(?:link|io)")
 _CF_BIN_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 ProgressCb = Callable[[float, str], None]
@@ -714,20 +717,14 @@ def start_cloudflare_tunnel(port: int, timeout_s: float = 20.0) -> tuple[subproc
     return proc, url
 
 
-def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.Popen, str]:
-    """Launch an SSH HTTPS tunnel via localhost.run (no API account or token needed)."""
-    ssh_bin = shutil.which("ssh")
-    if not ssh_bin:
-        raise RuntimeError("`ssh` binary is not available for localhost.run fallback.")
+def _start_ssh_tunnel(
+    cmd: list[str],
+    url_re: re.Pattern[str],
+    name: str,
+    timeout_s: float = 25.0,
+) -> tuple[subprocess.Popen, str]:
     proc = subprocess.Popen(
-        [
-            ssh_bin,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ServerAliveInterval=30",
-            "-R", f"80:127.0.0.1:{port}",
-            "nokey@localhost.run",
-        ],
+        cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -741,9 +738,10 @@ def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subp
     def _reader() -> None:
         nonlocal url
         assert proc.stdout is not None
-        for line in proc.stdout:
+        for raw in proc.stdout:
+            line = _ANSI_RE.sub("", raw)
             lines.append(line)
-            m = _LHR_URL_RE.search(line)
+            m = url_re.search(line)
             if m and url is None:
                 url = m.group(0)
                 ev.set()
@@ -752,8 +750,55 @@ def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subp
     if not ev.wait(timeout=timeout_s) or not url:
         proc.terminate()
         tail = "".join(lines[-20:])
-        raise RuntimeError(f"localhost.run tunnel did not publish a URL within {timeout_s}s.\n{tail}")
+        raise RuntimeError(f"{name} tunnel did not publish a URL within {timeout_s}s.\n{tail}")
     return proc, url
+
+
+def start_localhost_run_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.Popen, str]:
+    """Launch an SSH HTTPS tunnel via localhost.run (no API account or token needed)."""
+    ssh_bin = shutil.which("ssh")
+    if not ssh_bin:
+        raise RuntimeError("`ssh` binary is not available for localhost.run tunnel.")
+    return _start_ssh_tunnel(
+        [
+            ssh_bin,
+            "-T",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"UserKnownHostsFile={os.devnull}",
+            "-o", "BatchMode=yes",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-R", f"80:127.0.0.1:{port}",
+            "nokey@localhost.run",
+        ],
+        _LHR_URL_RE,
+        "localhost.run",
+        timeout_s=timeout_s,
+    )
+
+
+def start_pinggy_tunnel(port: int, timeout_s: float = 25.0) -> tuple[subprocess.Popen, str]:
+    """Launch an SSH HTTPS tunnel via pinggy.io on port 443 (no API account needed)."""
+    ssh_bin = shutil.which("ssh")
+    if not ssh_bin:
+        raise RuntimeError("`ssh` binary is not available for pinggy tunnel.")
+    return _start_ssh_tunnel(
+        [
+            ssh_bin,
+            "-T",
+            "-p", "443",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"UserKnownHostsFile={os.devnull}",
+            "-o", "BatchMode=yes",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-R0:127.0.0.1:{port}".format(port=port),
+            "a.pinggy.io",
+        ],
+        _PINGGY_URL_RE,
+        "pinggy.io",
+        timeout_s=timeout_s,
+    )
 
 
 def start_remote_server(
@@ -762,6 +807,8 @@ def start_remote_server(
     tunnel: str | None = "auto",
     cookies_source: str | Path | None = None,
     work_root: str | Path | None = None,
+    publish_beacon: bool = True,
+    endpoint_slug: str = "sautlab-endpoint",
     block: bool = True,
 ) -> dict[str, Any]:
     """Start the Kaggle remote GPU worker server and print local GUI connection commands."""
@@ -779,22 +826,53 @@ def start_remote_server(
     tunnel_proc = None
     public_url = f"http://127.0.0.1:{actual_port}"
     try:
-        if tunnel in {"auto", "cloudflared"}:
+        if tunnel == "auto":
+            errors: list[str] = []
+            for label, fn in (
+                ("localhost.run", start_localhost_run_tunnel),
+                ("pinggy.io", start_pinggy_tunnel),
+                ("cloudflared", start_cloudflare_tunnel),
+            ):
+                try:
+                    tunnel_proc, public_url = fn(actual_port)
+                    break
+                except Exception as exc:
+                    errors.append(f"{label}: {str(exc).splitlines()[0]}")
+            else:
+                raise RuntimeError("All remote tunnel providers failed:\n  " + "\n  ".join(errors))
+        elif tunnel == "localhost.run":
+            tunnel_proc, public_url = start_localhost_run_tunnel(actual_port)
+        elif tunnel == "pinggy":
+            tunnel_proc, public_url = start_pinggy_tunnel(actual_port)
+        elif tunnel == "cloudflared":
             try:
                 tunnel_proc, public_url = start_cloudflare_tunnel(actual_port)
             except Exception as cf_err:
-                if tunnel == "auto" or "429" in str(cf_err):
-                    print(f"⚠️  Cloudflare tunnel unavailable ({str(cf_err).splitlines()[0]}); trying localhost.run SSH tunnel...")
+                if "429" in str(cf_err):
+                    print("⚠️  Cloudflare returned 429; falling back to localhost.run SSH tunnel...")
                     tunnel_proc, public_url = start_localhost_run_tunnel(actual_port)
                 else:
                     raise
-        elif tunnel == "localhost.run":
-            tunnel_proc, public_url = start_localhost_run_tunnel(actual_port)
     except Exception:
         _stop_server(server, mgr, tunnel_proc)
         raise
 
     health = mgr.health_info()
+    beacon_id = None
+    if publish_beacon and tunnel not in (None, "", "none"):
+        try:
+            beacon_id = publish_kaggle_endpoint(
+                public_url,
+                extra={
+                    "device": health["device"],
+                    "cuda": health["cuda"],
+                    "has_cookies": health["has_cookies"],
+                },
+                slug=endpoint_slug,
+            )
+        except Exception as exc:
+            print(f"⚠️  Auto-Beacon skipped ({exc})")
+
     print("=" * 72)
     print("🚀 SautLab Kaggle Remote GPU Server is LIVE")
     print("=" * 72)
@@ -802,9 +880,12 @@ def start_remote_server(
     print(f"   Device         : {health['device']} (CUDA={health['cuda']})")
     print(f"   Kaggle Cookies : {'DETECTED' if health['has_cookies'] else 'Not found'}")
     print(f"   Videos cached  : {health['videos_count']}")
-    print("")
-    print("💻 Run on your PC:")
-    print(f'   python run_gui.py --kaggle-url "{public_url}"')
+    if beacon_id:
+        print(f"   Auto-Beacon    : PUBLISHED to private dataset '{beacon_id}'")
+        print("   PC Connect     : python run_gui.py   (auto-connects with zero copy-paste!)")
+    else:
+        print("   Auto-Beacon    : Not published (add KAGGLE_API_TOKEN to Kaggle Secrets for zero-copy)")
+        print(f'   PC Connect     : python run_gui.py --kaggle-url "{public_url}"')
     print("")
     print("⏹️  Interrupt the Kaggle cell (Stop button) when you finish in the local GUI.")
     print("=" * 72)

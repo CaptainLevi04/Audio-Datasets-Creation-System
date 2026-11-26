@@ -370,19 +370,50 @@ class KaggleBridgeAndRemoteTests(unittest.TestCase):
             self.assertTrue((local_data / vid2 / "segments" / "segment_0001.wav").exists())
             self.assertFalse(should_auto_import(z2, local_data))
 
-        # Tunnel auto-fallback when cloudflared fails with 429
+        # Tunnel auto-fallback chain (localhost.run -> pinggy -> cloudflared) + beacon publish
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         with (
-            patch("sautlab.remote_server.start_cloudflare_tunnel", side_effect=RuntimeError("Cloudflare quick tunnel returned 429 rate-limit")),
-            patch("sautlab.remote_server.start_localhost_run_tunnel", return_value=(fake_proc, "https://abc123.lhr.life")) as lhr_mock,
+            patch("sautlab.remote_server.start_localhost_run_tunnel", side_effect=RuntimeError("lhr down")),
+            patch("sautlab.remote_server.start_pinggy_tunnel", return_value=(fake_proc, "https://xyz.a.free.pinggy.link")) as png_mock,
+            patch("sautlab.remote_server.publish_kaggle_endpoint", return_value="amrgamal007/sautlab-endpoint") as pub_mock,
         ):
             handle = start_remote_server(data_dir=Path(tempfile.mkdtemp()), port=0, tunnel="auto", block=False)
             try:
-                self.assertEqual(handle["url"], "https://abc123.lhr.life")
-                lhr_mock.assert_called_once()
+                self.assertEqual(handle["url"], "https://xyz.a.free.pinggy.link")
+                png_mock.assert_called_once()
+                pub_mock.assert_called_once()
             finally:
                 handle["stop"]()
+
+        # Auto-beacon lazy connection: GUI starts local, Kaggle comes online later, next action auto-binds
+        with tempfile.TemporaryDirectory() as tmp2:
+            tp = Path(tmp2)
+
+            def _dl(url, ddir, ck, prog):
+                vd = ddir / "autoVid1234"
+                vd.mkdir(parents=True, exist_ok=True)
+                write_wav(vd / "audio.wav", _make_tone(4.0), sample_rate=SR)
+                info = {"video_id": "autoVid1234", "title": "Auto", "duration_s": 4.0}
+                (vd / "info.json").write_text(json.dumps(info), encoding="utf-8")
+                return "autoVid1234", info
+
+            mgr = RemoteJobManager(data_dir=tp / "kdata", download_fn=_dl)
+            srv, _ = create_remote_http_server(data_dir=tp / "kdata", host="127.0.0.1", port=0, manager=mgr)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                lazy_client = RemoteKaggleBackend(tp / "pcdata", remote_url=None, auto_beacon=True, poll_interval=0.05)
+                self.assertFalse(lazy_client.is_remote)
+                with patch("sautlab.kaggle_bridge.fetch_kaggle_endpoint", return_value={"url": f"http://127.0.0.1:{port}"}):
+                    vi = lazy_client.download("https://www.youtube.com/watch?v=autoVid1234", lambda _f, _m="": None)
+                self.assertTrue(lazy_client.is_remote)
+                self.assertEqual(lazy_client.remote_url, f"http://127.0.0.1:{port}")
+                self.assertEqual(vi.id, "autoVid1234")
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                mgr.shutdown()
 
 
 if __name__ == "__main__":

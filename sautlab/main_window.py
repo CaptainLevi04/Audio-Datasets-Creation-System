@@ -300,6 +300,7 @@ class MainWindow(QMainWindow):
             sm.addAction(self._act("YouTube cookies.txt...", self._set_cookies))
         if hasattr(self.backend, "remote_url"):
             sm.addAction(self._act("Kaggle Remote Server URL...", self._set_kaggle_url))
+            sm.addAction(self._act("Connect to Kaggle Auto-Beacon", self._connect_auto_beacon))
         ctx = sm.addMenu("Listen-around-cut context")
         grp = QActionGroup(self)
         for sec in (1.0, 1.5, 2.0, 3.0):
@@ -359,6 +360,10 @@ class MainWindow(QMainWindow):
         self._refresh_videos()
         if self.c.videos:
             self._select_video(self.c.videos[0].id)
+        if getattr(self.backend, "is_remote", False):
+            self.c.log_info(f"Connected to Kaggle GPU server: {self.backend.remote_url}", kind="ok")
+        elif getattr(self.backend, "auto_beacon", False):
+            self.c.log_info("Kaggle Auto-Beacon active (will bind automatically once Kaggle Run All starts).", kind="info")
         if self._watch_dirs and hasattr(self.backend, "import_kaggle_zip"):
             self._download_timer = QTimer(self)
             self._download_timer.setInterval(3000)
@@ -524,6 +529,31 @@ class MainWindow(QMainWindow):
             )
         )
         w.failed.connect(self._worker_failed("Could not reach Kaggle Remote Server"))
+        self._run_worker(w)
+
+    def _connect_auto_beacon(self) -> None:
+        if not hasattr(self.backend, "connect_auto_beacon"):
+            return
+        self.c.log_info("Checking private Kaggle Auto-Beacon...", kind="info")
+
+        def _do(_prog):
+            health = self.backend.connect_auto_beacon()
+            if not health:
+                raise RuntimeError(
+                    "No live Kaggle Auto-Beacon found. Make sure Phase 4 (`START_REMOTE_SERVER = True`) is running "
+                    "on Kaggle and `KAGGLE_API_TOKEN` is set in Kaggle Add-ons -> Secrets."
+                )
+            return health
+
+        w = Worker(_do)
+        w.done.connect(
+            lambda info: self.c.log_info(
+                f"Auto-connected to Kaggle GPU ({self.backend.remote_url}): {info.get('device', 'unknown')} | "
+                f"cookies={'yes' if info.get('has_cookies') else 'no'}",
+                kind="ok",
+            )
+        )
+        w.failed.connect(self._worker_failed("Kaggle Auto-Beacon unavailable"))
         self._run_worker(w)
 
     def _import_kaggle_zip(self) -> None:

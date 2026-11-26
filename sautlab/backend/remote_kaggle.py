@@ -17,11 +17,14 @@ from pathlib import Path
 from ..kaggle_bridge import (
     ensure_conditioned_flac,
     hydrate_video_dir,
+    resolve_live_kaggle_url,
     unpack_corpus_archive,
 )
 from ..models import Segment, VideoInfo
 from .base import Progress
 from .corpus import CorpusBackend, _write_json
+
+_HTTP_HEADERS = {"User-Agent": "SautLab-Client/1.0", "X-Pinggy-No-Screen": "true"}
 
 
 class RemoteKaggleBackend(CorpusBackend):
@@ -32,15 +35,34 @@ class RemoteKaggleBackend(CorpusBackend):
         data_dir: str | Path = "corpus_data",
         remote_url: str | None = None,
         poll_interval: float = 1.5,
+        auto_beacon: bool = False,
+        endpoint_slug: str = "sautlab-endpoint",
         **kwargs,
     ):
         super().__init__(data_dir=data_dir, **kwargs)
         self.remote_url = (remote_url or "").strip().rstrip("/") or None
         self.poll_interval = float(poll_interval)
+        self.auto_beacon = bool(auto_beacon)
+        self.endpoint_slug = endpoint_slug
 
     @property
     def is_remote(self) -> bool:
         return bool(self.remote_url)
+
+    def connect_auto_beacon(self, slug: str | None = None) -> dict | None:
+        """Look up live Kaggle server URL from the private beacon dataset and verify health."""
+        url, health = resolve_live_kaggle_url(slug=slug or self.endpoint_slug, timeout_s=5.0)
+        if url and health:
+            self.remote_url = url
+            return health
+        return None
+
+    def _ensure_remote(self) -> bool:
+        if self.remote_url:
+            return True
+        if self.auto_beacon:
+            return self.connect_auto_beacon() is not None
+        return False
 
     def _url(self, route: str) -> str:
         if not self.remote_url:
@@ -49,7 +71,9 @@ class RemoteKaggleBackend(CorpusBackend):
 
     def _api_json(self, method: str, route: str, payload: dict | None = None, timeout: float = 60.0) -> dict:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        headers = dict(_HTTP_HEADERS)
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         req = urllib.request.Request(self._url(route), data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -66,10 +90,11 @@ class RemoteKaggleBackend(CorpusBackend):
 
     def _upload_file(self, route: str, file_path: Path, timeout: float = 300.0) -> dict:
         raw = file_path.read_bytes()
+        headers = {**_HTTP_HEADERS, "Content-Type": "application/octet-stream"}
         req = urllib.request.Request(
             self._url(route),
             data=raw,
-            headers={"Content-Type": "application/octet-stream"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -82,7 +107,7 @@ class RemoteKaggleBackend(CorpusBackend):
     def _download_file(self, route: str, dst: Path, progress: Progress, label: str, timeout: float = 300.0) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(dst.suffix + ".part")
-        req = urllib.request.Request(self._url(route), method="GET")
+        req = urllib.request.Request(self._url(route), headers=dict(_HTTP_HEADERS), method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
@@ -148,7 +173,7 @@ class RemoteKaggleBackend(CorpusBackend):
     # Overridden Backend API methods (route heavy steps to Kaggle GPU)
     # ------------------------------------------------------------------
     def download(self, url: str, progress: Progress) -> VideoInfo:
-        if not self.is_remote:
+        if not self._ensure_remote():
             return super().download(url, progress)
 
         cookies_txt = None
@@ -168,7 +193,7 @@ class RemoteKaggleBackend(CorpusBackend):
     def extract_audio(self, video_id: str, sample_rate: int, channels: int, progress: Progress) -> str:
         vdir = self._dir(video_id)
         wav = vdir / "audio.wav"
-        if not self.is_remote or wav.exists():
+        if not self._ensure_remote() or wav.exists():
             return super().extract_audio(video_id, sample_rate, channels, progress)
 
         if sample_rate != 16000 or channels != 1:
@@ -186,7 +211,7 @@ class RemoteKaggleBackend(CorpusBackend):
         return str(wav)
 
     def run_pipeline(self, video_id: str, progress: Progress) -> list[Segment]:
-        if not self.is_remote:
+        if not self._ensure_remote():
             return super().run_pipeline(video_id, progress)
 
         vdir = self._dir(video_id)

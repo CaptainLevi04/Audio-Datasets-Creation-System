@@ -384,6 +384,181 @@ def display_kaggle_zip_download(
 
 
 # ---------------------------------------------------------------------
+# 2c. Private Kaggle Auto-Beacon (publish / discover live tunnel URL)
+# ---------------------------------------------------------------------
+
+def _get_authenticated_kaggle_api():
+    """Return `(KaggleApi, username)` using env vars, Kaggle Secrets, or ~/.kaggle/."""
+    import os
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+    except Exception:
+        return None, None
+
+    if not os.environ.get("KAGGLE_API_TOKEN"):
+        try:
+            from kaggle_secrets import UserSecretsClient  # type: ignore
+
+            sec = UserSecretsClient()
+            for key in ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"):
+                try:
+                    val = sec.get_secret(key)
+                    if val and not os.environ.get(key):
+                        os.environ[key] = str(val).strip()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if not os.environ.get("KAGGLE_API_TOKEN"):
+        acc = Path.home() / ".kaggle" / "access_token"
+        if acc.is_file():
+            tok = acc.read_text(encoding="utf-8", errors="ignore").strip()
+            if tok:
+                os.environ["KAGGLE_API_TOKEN"] = tok
+
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        username = api.config_values.get("username") or os.environ.get("KAGGLE_USERNAME")
+        if not username:
+            return None, None
+        return api, str(username).strip()
+    except Exception:
+        return None, None
+
+
+def publish_kaggle_endpoint(
+    url: str,
+    extra: dict | None = None,
+    slug: str = "sautlab-endpoint",
+) -> str | None:
+    """Publish live tunnel `url` to a PRIVATE Kaggle dataset `<user>/<slug>`."""
+    import tempfile
+    import time
+
+    api, username = _get_authenticated_kaggle_api()
+    if api is None or not username:
+        return None
+
+    dataset_id = f"{username}/{slug}"
+    payload = {
+        "url": str(url).strip().rstrip("/"),
+        "updated_at": time.time(),
+        "iso_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if extra:
+        payload.update(extra)
+
+    with tempfile.TemporaryDirectory(prefix="sautlab_beacon_") as tmp:
+        tmp_dir = Path(tmp)
+        (tmp_dir / "endpoint.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        meta = {
+            "title": "SautLab Endpoint",
+            "id": dataset_id,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        (tmp_dir / "dataset-metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        exists = False
+        try:
+            api.dataset_list_files(dataset_id)
+            exists = True
+        except Exception:
+            try:
+                found = api.dataset_list(user=username, search=slug)
+                exists = any(getattr(d, "ref", "") == dataset_id for d in found)
+            except Exception:
+                exists = False
+
+        if exists:
+            api.dataset_create_version(
+                str(tmp_dir),
+                version_notes=f"Live tunnel {payload['url']}",
+                quiet=True,
+                convert_to_csv=False,
+            )
+        else:
+            api.dataset_create_new(
+                str(tmp_dir),
+                public=False,
+                quiet=True,
+                convert_to_csv=False,
+            )
+    return dataset_id
+
+
+def fetch_kaggle_endpoint(
+    slug: str = "sautlab-endpoint",
+    max_age_s: float = 12 * 3600,
+) -> dict | None:
+    """Read the latest live tunnel URL from private Kaggle dataset `<user>/<slug>`."""
+    import tempfile
+    import time
+
+    api, username = _get_authenticated_kaggle_api()
+    if api is None or not username:
+        return None
+    dataset_id = f"{username}/{slug}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="sautlab_fetch_") as tmp:
+            api.dataset_download_file(dataset_id, "endpoint.json", path=tmp, force=True, quiet=True)
+            ep_file = Path(tmp) / "endpoint.json"
+            if not ep_file.exists():
+                ep_zip = Path(tmp) / "endpoint.json.zip"
+                if ep_zip.exists():
+                    with zipfile.ZipFile(ep_zip, "r") as zf:
+                        zf.extractall(tmp)
+            if not ep_file.exists():
+                return None
+            data = json.loads(ep_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    url = str(data.get("url") or "").strip().rstrip("/")
+    if not url:
+        return None
+    updated_at = float(data.get("updated_at") or 0.0)
+    if max_age_s > 0 and updated_at > 0 and (time.time() - updated_at) > max_age_s:
+        return None
+    data["url"] = url
+    data["dataset_id"] = dataset_id
+    return data
+
+
+def resolve_live_kaggle_url(
+    explicit_url: str | None = None,
+    slug: str = "sautlab-endpoint",
+    timeout_s: float = 5.0,
+) -> tuple[str | None, dict | None]:
+    """Return `(live_url, health_dict)` if explicit URL or live Kaggle beacon responds healthy."""
+    import urllib.request
+
+    if explicit_url and explicit_url.strip():
+        return explicit_url.strip().rstrip("/"), None
+
+    info = fetch_kaggle_endpoint(slug=slug)
+    if not info:
+        return None, None
+
+    url = info["url"]
+    req = urllib.request.Request(
+        f"{url}/api/health",
+        headers={"User-Agent": "SautLab-Client/1.0", "X-Pinggy-No-Screen": "true"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+            if isinstance(health, dict) and health.get("status") == "ok":
+                return url, health
+    except Exception:
+        return None, None
+    return None, None
+
+
+# ---------------------------------------------------------------------
 # 3. Arabic Normalization, jiwer Comparison & Dual ASR Runner (Step 6)
 # ---------------------------------------------------------------------
 

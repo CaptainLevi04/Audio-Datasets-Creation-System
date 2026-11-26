@@ -29,6 +29,10 @@ def main() -> int:
     ap.add_argument("--cookies", default=None, help="YouTube cookies.txt, if YouTube blocks the download")
     ap.add_argument("--kaggle-url", default=os.environ.get("SAUTLAB_KAGGLE_URL"),
                     help="remote Kaggle GPU server URL from main-runner.ipynb (or set SAUTLAB_KAGGLE_URL)")
+    ap.add_argument("--endpoint-slug", default="sautlab-endpoint",
+                    help="private Kaggle dataset slug for Auto-Beacon discovery (default: sautlab-endpoint)")
+    ap.add_argument("--no-auto-beacon", action="store_true",
+                    help="disable automatic connection to private Kaggle Auto-Beacon")
     ap.add_argument("--import-zip", default=None,
                     help="unpack a Kaggle output .zip (compact or full) into --data-dir and hydrate locally")
     ap.add_argument("--watch-dir", default=None,
@@ -64,6 +68,7 @@ def main() -> int:
                 auto_import_latest_zip,
                 default_downloads_dirs,
                 record_auto_import,
+                resolve_live_kaggle_url,
                 unpack_corpus_archive,
             )
 
@@ -77,12 +82,20 @@ def main() -> int:
                     print(f"[SautLab] Auto-imported {zp.name} -> {len(vids)} video(s): {', '.join(vids)}")
 
             kaggle_url = args.kaggle_url
+            if not kaggle_url and not args.no_auto_beacon:
+                live_url, health = resolve_live_kaggle_url(slug=args.endpoint_slug, timeout_s=4.0)
+                if live_url:
+                    kaggle_url = live_url
+                    dev = (health or {}).get("device", "Kaggle")
+                    print(f"[SautLab] Auto-connected to Kaggle GPU beacon: {live_url} ({dev})")
 
             def backend_factory(folder: str | Path) -> RemoteKaggleBackend:
                 cur_url = getattr(backend, "remote_url", kaggle_url)
                 return RemoteKaggleBackend(
                     folder,
                     remote_url=cur_url,
+                    auto_beacon=not args.no_auto_beacon,
+                    endpoint_slug=args.endpoint_slug,
                     classifier=args.classifier,
                     vad=args.vad,
                     snr_threshold=args.snr_threshold,
@@ -93,6 +106,8 @@ def main() -> int:
             backend = RemoteKaggleBackend(
                 args.data_dir,
                 remote_url=kaggle_url,
+                auto_beacon=not args.no_auto_beacon,
+                endpoint_slug=args.endpoint_slug,
                 classifier=args.classifier,
                 vad=args.vad,
                 snr_threshold=args.snr_threshold,
