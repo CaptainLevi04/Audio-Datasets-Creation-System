@@ -14,6 +14,7 @@ Implements Student 1 AI Implementation Specification v2.2:
 
 from pathlib import Path
 from dataclasses import dataclass
+import gc
 import json
 import bisect
 import shutil
@@ -821,20 +822,39 @@ def cut_four_label_segments(audio: np.ndarray,
         except OSError:
             pass
 
-    # Optional word verification with faster-whisper
-    word_model = _load_word_model(word_model_size) if use_word_verification else None
+    # Optional 3rd detector & word boundary verification with faster-whisper
     all_words = []
-    if word_model is not None:
+    wt_path = out_dir / "word_timestamps.json"
+    audio_wav = out_dir / "audio.wav"
+    if use_word_verification and wt_path.exists():
         try:
-            all_words = transcribe_words(word_model, audio, 0.0)
-            print(f"🎙️ Transcribed {len(all_words)} word tokens for boundary verification.")
-        except Exception as e:
-            print(f"⚠️ Whisper full pass skipped/failed: {e}")
-    elif (out_dir / "word_timestamps.json").exists():
+            if (not audio_wav.exists()) or wt_path.stat().st_mtime >= audio_wav.stat().st_mtime:
+                cached_words = json.loads(wt_path.read_text(encoding="utf-8"))
+                if isinstance(cached_words, list) and cached_words:
+                    all_words = cached_words
+                    print(f"🎙️ Loaded {len(all_words)} cached word tokens from word_timestamps.json.")
+        except Exception:
+            all_words = []
+
+    if use_word_verification and not all_words:
+        word_model = _load_word_model(word_model_size)
+        if word_model is not None:
+            try:
+                all_words = transcribe_words(word_model, audio, 0.0)
+                print(f"🎙️ Transcribed {len(all_words)} word tokens for boundary verification.")
+            except Exception as e:
+                print(f"⚠️ Whisper full pass skipped/failed: {e}")
+            finally:
+                # Immediately release Whisper VRAM (~0.7 GB) before DP cutting & later ASR phases.
+                del word_model
+                gc.collect()
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    elif not use_word_verification and wt_path.exists():
         try:
-            all_words = json.loads((out_dir / "word_timestamps.json").read_text(encoding="utf-8"))
+            all_words = json.loads(wt_path.read_text(encoding="utf-8"))
             print(f"🎙️ Loaded {len(all_words)} cached word tokens from word_timestamps.json.")
-        except Exception as e:
+        except Exception:
             pass
 
     # Build candidates using unified voting grid

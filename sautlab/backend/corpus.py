@@ -90,7 +90,7 @@ class CorpusBackend(Backend):
         vad: str = "auto",  # auto | silero | energy
         snr_threshold: float = 25.0,
         snr_combine: str = "mean",
-        word_verification: bool = False,
+        word_verification: bool = True,
         cookies_file: str | None = None,
         device: str | None = None,
         run_asr: bool | None = None,
@@ -589,7 +589,12 @@ class CorpusBackend(Backend):
 
             # step 4: segmentation
             self._set_running(video_id, "segmentation", True)
-            progress(0.25, "Cutting segments at pauses...")
+            seg_msg = (
+                "Cutting segments (3-detector voting + Whisper words)..."
+                if self.word_verification
+                else "Cutting segments at pauses..."
+            )
+            progress(0.25, seg_msg)
             segments_df = sc.cut_speech_and_mixed_segments(
                 audio=audio, regions_df=regions_df, out_dir=vdir, sr=sr, pauses=pauses_df,
                 use_word_verification=self.word_verification, run_ablation=self.run_ablation,
@@ -610,6 +615,7 @@ class CorpusBackend(Backend):
                 sc.generate_qc_markdown_report(segments_df, report_path=vdir / "qc_report.md", video_dir=vdir, qc=qc)
             except Exception as e:  # the report is a bonus, never stop the pipeline for it
                 progress(0.35, f"QC report skipped: {e}")
+            free_cuda_memory()
             self._set_running(video_id, "segmentation", False)
 
             # step 5: SNR
