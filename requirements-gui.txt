@@ -1,0 +1,16 @@
+# Backend (Steps 1-5): see requirements.txt
+-r requirements.txt
+# Needed to import the speech_corpus package (it also contains the notebook inspectors)
+ipywidgets>=8.0
+ipython>=8.0
+jiwer>=3.0
+# AST region classifier (Step 3). Without these the GUI falls back to the weaker heuristic.
+transformers>=4.40
+# Optional: Silero VAD for Step 4 pause detection (otherwise the energy detector is used)
+# silero-vad
+# GUI
+PySide6>=6.6
+pyqtgraph>=0.13.3
+qtawesome>=1.3
+# Optional: Kaggle browser GUI (Step 8 in runner.ipynb)
+# gradio>=4.0

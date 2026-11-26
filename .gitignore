@@ -44,3 +44,5 @@ env/
 # OS specific
 .DS_Store
 Thumbs.db
+corpus_data/
+mock_workspace/
