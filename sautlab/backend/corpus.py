@@ -88,7 +88,7 @@ class CorpusBackend(Backend):
         data_dir: str | Path = "data",
         classifier: str = "auto",  # auto | ast | heuristic
         vad: str = "auto",  # auto | silero | energy
-        snr_threshold: float = 25.0,
+        snr_threshold: float = 20.0,
         snr_combine: str = "mean",
         word_verification: bool = False,
         cookies_file: str | None = None,

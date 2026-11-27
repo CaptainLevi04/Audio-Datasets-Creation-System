@@ -25,7 +25,7 @@ from .audio import DEFAULT_SR, read_wav
 # ---------------------------------------------------------------------
 # Defaults (all tunable; document the final values in the report)
 # ---------------------------------------------------------------------
-DEFAULT_THRESHOLD_DB = 25.0     # assignment's starting point
+DEFAULT_THRESHOLD_DB = 20.0     # clean/noisy cut-off in dB
 SNR_MIN_DB = -5.0               # clamp range for the energy method
 SNR_MAX_DB = 60.0
 DISAGREE_DB = 8.0               # flag if |energy - wada| exceeds this
@@ -111,7 +111,7 @@ def validate_wada_table() -> None:
 
 def snr_energy(x: np.ndarray, sr: int = DEFAULT_SR,
                frame_ms: float = 25.0, hop_ms: float = 10.0,
-               noise_percentile: float = 10.0,
+               noise_percentile: float = 2.0,
                speech_margin_db: float = 10.0,
                min_speech_frac: float = 0.10,
                clamp: tuple[float, float] = (SNR_MIN_DB, SNR_MAX_DB)) -> float:
@@ -183,16 +183,20 @@ def snr_wada(x: np.ndarray,
 
 def combine_snr(snr_e: float, snr_w: float,
                 mode: Literal["mean", "wada", "energy", "min"] = "mean") -> float:
-    """Combine the two estimates into the single value used for the decision."""
-    vals = [v for v in (snr_e, snr_w) if v is not None and np.isfinite(v)]
+    """Combine the two estimates (default `mean` = 2/3 Energy + 1/3 WADA)."""
+    e_ok = snr_e is not None and np.isfinite(snr_e)
+    w_ok = snr_w is not None and np.isfinite(snr_w)
+    vals = [v for v, ok in ((snr_e, e_ok), (snr_w, w_ok)) if ok]
     if not vals:
         return float("nan")
     if mode == "wada":
-        return float(snr_w) if np.isfinite(snr_w) else float(np.mean(vals))
+        return float(snr_w) if w_ok else float(np.mean(vals))
     if mode == "energy":
-        return float(snr_e) if np.isfinite(snr_e) else float(np.mean(vals))
+        return float(snr_e) if e_ok else float(np.mean(vals))
     if mode == "min":
         return float(np.min(vals))
+    if e_ok and w_ok:
+        return float((2.0 * float(snr_e) + 1.0 * float(snr_w)) / 3.0)
     return float(np.mean(vals))
 
 

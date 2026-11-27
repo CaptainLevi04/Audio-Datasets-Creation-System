@@ -644,7 +644,7 @@ def build_gradio_app(
 def launch_kaggle_gui(
     data_dir: str | Path = "corpus_data",
     user: str = "Team",
-    snr_threshold: float = 25.0,
+    snr_threshold: float = 20.0,
     snr_combine: str = "mean",
     cookies_file: str | None = None,
     share: bool = True,

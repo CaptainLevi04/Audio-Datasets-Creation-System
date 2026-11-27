@@ -27,7 +27,7 @@ class AnnotationSession:
     def __init__(self, backend: Backend, user: str = "Team"):
         self.backend = backend
         self.user = (user or "Team").strip() or "Team"
-        self.snr_threshold = float(getattr(backend, "snr_threshold", 25.0))
+        self.snr_threshold = float(getattr(backend, "snr_threshold", 20.0))
         self.asr_names = tuple(getattr(backend, "asr_names", ("Whisper", "Audar")))
         self.videos: list[VideoInfo] = backend.list_videos()
         self.video: VideoInfo | None = None

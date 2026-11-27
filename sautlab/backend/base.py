@@ -24,7 +24,7 @@ class Backend(ABC):
     # names shown for the two ASR systems (model A = first transcript column)
     asr_names: tuple[str, str] = ("Whisper", "Audar")
     # clean / noisy cut-off in dB used for the automatic label
-    snr_threshold: float = 25.0
+    snr_threshold: float = 20.0
 
     @abstractmethod
     def list_videos(self) -> list[VideoInfo]:

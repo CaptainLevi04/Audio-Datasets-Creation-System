@@ -420,6 +420,15 @@ class LocalDualAsrTests(unittest.TestCase):
             self.assertEqual(urls, [LLAMA_CPP_RELEASE_URL, LLAMA_CPP_CUDART_URL])
             self.assertEqual(exe_cuda.name, "llama-server.exe")
 
+    def test_snr_weighted_combine_and_defaults(self) -> None:
+        import inspect
+        from speech_corpus.snr import DEFAULT_THRESHOLD_DB, combine_snr, snr_energy
+
+        self.assertEqual(DEFAULT_THRESHOLD_DB, 20.0)
+        self.assertEqual(inspect.signature(snr_energy).parameters["noise_percentile"].default, 2.0)
+        self.assertAlmostEqual(combine_snr(30.0, 15.0, mode="mean"), 25.0, places=5)
+        self.assertEqual(CorpusBackend(Path(tempfile.gettempdir())).snr_threshold, 20.0)
+
 
 if __name__ == "__main__":
     unittest.main()

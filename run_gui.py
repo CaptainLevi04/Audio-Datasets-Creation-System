@@ -23,7 +23,7 @@ def main() -> int:
     ap.add_argument("--classifier", choices=["auto", "ast", "heuristic"], default="auto",
                     help="region classifier for Step 3 (auto = AST when torch and transformers are installed)")
     ap.add_argument("--vad", choices=["auto", "silero", "energy"], default="auto", help="pause detector for Step 4")
-    ap.add_argument("--snr-threshold", type=float, default=25.0, help="clean/noisy cut-off in dB (default 25)")
+    ap.add_argument("--snr-threshold", type=float, default=20.0, help="clean/noisy cut-off in dB (default 20)")
     ap.add_argument("--device", choices=["cuda", "cpu"], default=None, help="device for neural models (AST / Conformer)")
     ap.add_argument("--cookies", default=None, help="YouTube cookies.txt, if YouTube blocks the download")
     ap.add_argument("--no-asr", action="store_true", help="run Steps 3-5 only and skip local Dual ASR")
