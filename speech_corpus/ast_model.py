@@ -83,6 +83,7 @@ class ASTInferenceEngine:
             return
 
         try:
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
             from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
             print(f"[AST] Loading '{self.model_id}' on {self.device.upper()}...")
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(self.model_id)

@@ -45,6 +45,25 @@ LLAMA_CPP_RELEASE_URL = (
     "https://github.com/ggml-org/llama.cpp/releases/download/b12780/"
     "llama-b12780-bin-win-cuda-12.4-x64.zip"
 )
+LLAMA_CPP_CUDART_URL = (
+    "https://github.com/ggml-org/llama.cpp/releases/download/b12780/"
+    "cudart-llama-bin-win-cuda-12.4-x64.zip"
+)
+LLAMA_CPP_CPU_URL = (
+    "https://github.com/ggml-org/llama.cpp/releases/download/b12780/"
+    "llama-b12780-bin-win-cpu-x64.zip"
+)
+
+
+def _disable_hf_xet() -> None:
+    """Disable hf-xet CAS transport on Windows so Hugging Face downloads use standard HTTPS resume."""
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    try:
+        import huggingface_hub.constants as _hf_const
+
+        _hf_const.HF_HUB_DISABLE_XET = True
+    except Exception:
+        pass
 
 _AUDAR_PREFIX_RE = re.compile(r"^\s*language\s+[^\s<]+<asr_text>\s*", re.IGNORECASE)
 
@@ -104,33 +123,36 @@ def _subprocess_cuda_env(bin_dir: Path | None = None) -> dict[str, str]:
     return env
 
 
-def ensure_llama_cpp_server(cache_dir: Path | None = None) -> Path:
-    """Locate `llama-server` executable or download the prebuilt Windows CUDA release once."""
-    on_path = shutil.which("llama-server") or shutil.which("llama-server.exe")
-    if on_path:
-        return Path(on_path)
+def _has_cuda() -> bool:
+    try:
+        import torch
 
-    root = cache_dir or (Path.home() / ".cache" / "sautlab" / "llama_cpp")
-    root.mkdir(parents=True, exist_ok=True)
-    exe_name = "llama-server.exe" if sys.platform.startswith("win") else "llama-server"
-    found = next(root.rglob(exe_name), None)
-    if found is not None and found.is_file():
-        return found
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
-    if not sys.platform.startswith("win"):
-        raise FileNotFoundError(
-            "llama-server not found on PATH. Install llama.cpp with multimodal audio (mtmd) support."
-        )
 
+def _has_cuda_12_runtime(llama_root: Path) -> bool:
+    torch_lib = Path(sys.prefix) / "Lib" / "site-packages" / "torch" / "lib"
+    for dll in ("cudart64_12.dll", "cublas64_12.dll"):
+        in_llama = any(llama_root.rglob(dll))
+        in_torch = (torch_lib / dll).is_file()
+        if not (in_llama or in_torch):
+            return False
+    return True
+
+
+def _download_and_extract_zip(url: str, root: Path, zip_name: str) -> None:
     import httpx
 
-    zp = root / "llama-cuda.zip"
+    root.mkdir(parents=True, exist_ok=True)
+    zp = root / zip_name
     with httpx.Client(follow_redirects=True, timeout=60.0) as client:
         for attempt in range(8):
             pos = zp.stat().st_size if zp.exists() else 0
             headers = {"Range": f"bytes={pos}-"} if pos > 0 else {}
             try:
-                with client.stream("GET", LLAMA_CPP_RELEASE_URL, headers=headers) as r:
+                with client.stream("GET", url, headers=headers) as r:
                     if r.status_code == 416:
                         break
                     r.raise_for_status()
@@ -151,9 +173,41 @@ def ensure_llama_cpp_server(cache_dir: Path | None = None) -> Path:
         zf.extractall(root)
     zp.unlink(missing_ok=True)
 
-    found = next(root.rglob(exe_name), None)
+
+def ensure_llama_cpp_server(cache_dir: Path | None = None) -> Path:
+    """Locate `llama-server` executable or download the matching Windows CUDA/CPU release once."""
+    on_path = shutil.which("llama-server") or shutil.which("llama-server.exe")
+    if on_path:
+        return Path(on_path)
+
+    root = cache_dir or (Path.home() / ".cache" / "sautlab" / "llama_cpp")
+    root.mkdir(parents=True, exist_ok=True)
+    exe_name = "llama-server.exe" if sys.platform.startswith("win") else "llama-server"
+
+    if not sys.platform.startswith("win"):
+        found = next(root.rglob(exe_name), None)
+        if found is not None and found.is_file():
+            return found
+        raise FileNotFoundError(
+            "llama-server not found on PATH. Install llama.cpp with multimodal audio (mtmd) support."
+        )
+
+    use_cuda = _has_cuda()
+    target_dir = root if use_cuda else (root / "cpu")
+    found = next(
+        (p for p in target_dir.rglob(exe_name) if (use_cuda and "cpu" not in p.parts) or (not use_cuda and "cpu" in p.parts)),
+        None,
+    )
     if found is None or not found.is_file():
-        raise RuntimeError(f"Downloaded archive to {root}, but {exe_name} was not found.")
+        url = LLAMA_CPP_RELEASE_URL if use_cuda else LLAMA_CPP_CPU_URL
+        _download_and_extract_zip(url, target_dir, "llama-bin.zip")
+        found = next(target_dir.rglob(exe_name), None)
+
+    if use_cuda and not _has_cuda_12_runtime(target_dir):
+        _download_and_extract_zip(LLAMA_CPP_CUDART_URL, target_dir, "llama-cudart.zip")
+
+    if found is None or not found.is_file():
+        raise RuntimeError(f"Downloaded archive to {target_dir}, but {exe_name} was not found.")
     return found
 
 
@@ -163,12 +217,8 @@ def ensure_audar_gguf(
     mmproj_file: str = DEFAULT_AUDAR_MMPROJ,
 ) -> tuple[Path, Path]:
     """Download/resolve quantized Audar GGUF decoder + BF16 audio mmproj via Hugging Face cache."""
-    # Avoid hf-xet CAS stalls on Windows; standard HTTPS CDN supports full speed & disk resume.
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    import huggingface_hub.constants as _hf_const
+    _disable_hf_xet()
     from huggingface_hub import hf_hub_download
-
-    _hf_const.HF_HUB_DISABLE_XET = True
 
     model_path = Path(gguf_file)
     if not model_path.is_file():
@@ -222,6 +272,7 @@ def transcribe_conformer(
         return []
 
     free_cuda_memory()
+    _disable_hf_xet()
     _install_nemo_windows_signal_shim()
 
     import torch
@@ -375,6 +426,7 @@ def transcribe_audar_quantized(
             model_path, mmproj_path = ensure_audar_gguf(repo_id, gguf_file, mmproj_file)
             port = _free_local_port()
             base_url = f"http://127.0.0.1:{port}"
+            ngl = gpu_layers if _has_cuda() else 0
             cmd = [
                 str(srv_exe),
                 "-m",
@@ -386,7 +438,7 @@ def transcribe_audar_quantized(
                 "--port",
                 str(port),
                 "-ngl",
-                str(gpu_layers),
+                str(ngl),
                 "-c",
                 str(ctx_size),
                 "-np",

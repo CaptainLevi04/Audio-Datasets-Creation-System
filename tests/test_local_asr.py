@@ -379,6 +379,47 @@ class LocalDualAsrTests(unittest.TestCase):
         self.assertTrue(out_cands[0].word_risk)
         self.assertFalse(out_cands[1].word_risk)
 
+    def test_ensure_llama_cpp_server_handles_cpu_and_missing_cudart(self) -> None:
+        from sautlab.local_asr import (
+            LLAMA_CPP_CPU_URL,
+            LLAMA_CPP_CUDART_URL,
+            LLAMA_CPP_RELEASE_URL,
+            ensure_llama_cpp_server,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            urls: list[str] = []
+
+            def _fake_dl(url: str, root: Path, zip_name: str) -> None:
+                urls.append(url)
+                root.mkdir(parents=True, exist_ok=True)
+                if url in (LLAMA_CPP_RELEASE_URL, LLAMA_CPP_CPU_URL):
+                    (root / "llama-server.exe").write_bytes(b"")
+                elif url == LLAMA_CPP_CUDART_URL:
+                    (root / "cudart64_12.dll").write_bytes(b"")
+                    (root / "cublas64_12.dll").write_bytes(b"")
+
+            with (
+                patch("sautlab.local_asr.shutil.which", return_value=None),
+                patch("sautlab.local_asr._has_cuda", return_value=False),
+                patch("sautlab.local_asr._download_and_extract_zip", side_effect=_fake_dl),
+            ):
+                exe_cpu = ensure_llama_cpp_server(cache_dir=tp)
+            self.assertEqual(urls, [LLAMA_CPP_CPU_URL])
+            self.assertEqual(exe_cpu.name, "llama-server.exe")
+
+            urls.clear()
+            with (
+                patch("sautlab.local_asr.shutil.which", return_value=None),
+                patch("sautlab.local_asr._has_cuda", return_value=True),
+                patch("sautlab.local_asr._has_cuda_12_runtime", return_value=False),
+                patch("sautlab.local_asr._download_and_extract_zip", side_effect=_fake_dl),
+            ):
+                exe_cuda = ensure_llama_cpp_server(cache_dir=tp)
+            self.assertEqual(urls, [LLAMA_CPP_RELEASE_URL, LLAMA_CPP_CUDART_URL])
+            self.assertEqual(exe_cuda.name, "llama-server.exe")
+
 
 if __name__ == "__main__":
     unittest.main()
