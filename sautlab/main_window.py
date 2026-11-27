@@ -606,19 +606,25 @@ class MainWindow(QMainWindow):
             self, "Export CSV", f"{self.c.video.id}_review.csv", "CSV files (*.csv)"
         )
         if path:
-            export.write_csv(path, self.c.segments)
+            out_path = Path(path)
+            export.write_csv(out_path, self.c.segments)
+            sum_path = out_path.with_name(f"{out_path.stem}_summary.csv")
+            export.write_summary_csv(sum_path, [(self.c.video, self.c.segments)])
             self.backend.mark_exported(self.c.video.id)
             self.c.refresh_videos()
-            self.c.log_info(f"Exported CSV: {Path(path).name}")
+            self.c.log_info(f"Exported CSV: {out_path.name} (+ {sum_path.name})")
 
     def _export_all_csv(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Export CSV for all videos")
         if not folder:
             return
+        summary_items = []
         for v in self.c.videos:
             segs = self.c.segments if self.c.video and self.c.video.id == v.id else self.backend.load_segments(v.id)
             export.write_csv(Path(folder) / f"{v.id}_segments.csv", segs)
-        self.c.log_info(f"Exported {len(self.c.videos)} CSV files")
+            summary_items.append((v, segs))
+        export.write_summary_csv(Path(folder) / "summary_table.csv", summary_items)
+        self.c.log_info(f"Exported {len(self.c.videos)} CSV files + summary_table.csv")
 
     def _export_audio(self) -> None:
         if not self.c.video:

@@ -429,6 +429,38 @@ class LocalDualAsrTests(unittest.TestCase):
         self.assertAlmostEqual(combine_snr(30.0, 15.0, mode="mean"), 25.0, places=5)
         self.assertEqual(CorpusBackend(Path(tempfile.gettempdir())).snr_threshold, 20.0)
 
+    def test_summary_csv_export(self) -> None:
+        import csv
+        from sautlab import export
+        from sautlab.models import Segment, VideoInfo
+
+        v = VideoInfo(id="vid1", title="lecture", url="https://example.com", channel="ch", duration=3720.0, license="CC-BY")
+        segs = [
+            Segment(id=1, start=0.0, end=1800.0, label="speech", snr=24.0, status="accepted"),
+            Segment(id=2, start=1800.0, end=3240.0, label="speech", snr=24.0, status="accepted"),
+            Segment(id=3, start=3240.0, end=3360.0, label="music", snr=20.0, status="accepted"),
+            Segment(id=4, start=3360.0, end=3540.0, label="mixed", snr=24.0, status="needs_review"),
+            Segment(id=5, start=3540.0, end=3600.0, label="mixed", snr=28.0, status="difficult"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "summary_table.csv"
+            export.write_summary_csv(out, [(v, segs)])
+            with open(out, newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(list(r.keys()), export.SUMMARY_COLUMNS)
+        self.assertEqual(r["Video"], "vid1 — lecture")
+        self.assertEqual(r["Duration"], "62 min")
+        self.assertEqual(r["Speech"], "54 min")
+        self.assertEqual(r["Music"], "2 min")
+        self.assertEqual(r["Mixed"], "4 min")
+        self.assertEqual(r["Segments"], "5")
+        self.assertEqual(r["Mean SNR"], "24 dB")
+        self.assertEqual(r["Accepted"], "50%")
+        self.assertEqual(r["Chosen by hand"], "25%")
+        self.assertEqual(r["Difficult"], "25%")
+
 
 if __name__ == "__main__":
     unittest.main()

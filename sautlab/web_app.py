@@ -562,10 +562,11 @@ def build_gradio_app(
             vdir = Path(session.backend.audio_path(session.video.id)).parent
             exp_dir = vdir / "exported_accepted"
             export.write_csv(vdir / f"{session.video.id}_review.csv", session.segments)
+            export.write_summary_csv(vdir / f"{session.video.id}_summary.csv", [(session.video, session.segments)])
             n = export.export_segment_audio(session.backend.audio_path(session.video.id), exp_dir, session.video, session.segments)
             session.backend.mark_exported(session.video.id)
             session.refresh_videos()
-            return f"Exported `{session.video.id}_review.csv` and {n} accepted `.wav + .txt` pairs to `{exp_dir}`."
+            return f"Exported `{session.video.id}_review.csv`, `{session.video.id}_summary.csv`, and {n} accepted `.wav + .txt` pairs to `{exp_dir}`."
 
         def on_finish(u, sf_v, lf_v, qf_v, cs_v):
             session.user = (u or "Team").strip() or "Team"
